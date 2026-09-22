@@ -9,11 +9,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*ELKA VPN*\n\n"
         "От 1 Сервера\n"
         "Без логов подключений\n"
-        "Надёжное подключение\n"
+        "Надёжное подключение\n"        
         "Высокая скорость соединения"
     )
 
-    keyboard = InlineKeyboardMarkup(
+    keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("💳 Купить подписку", callback_data="buy_subscription")],
         [InlineKeyboardButton("📊 Моя подписка", callback_data="my_subscription")],
         [
@@ -42,10 +42,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "invite":
         await query.message.reply_text("Скоро")
     elif query.data == "docs":
-        await query.message.reply_text("Пользовательское Соглашение:"
-                                       "https://telegra.ph/Polzovatelskoe-soglashenie-09-21-65"
-                                       "Политика Конфиденциальности:"
-                                       "https://telegra.ph/Politika-konfidencialnosti-09-21-83.")
+        await query.message.reply_text(
+            "Пользовательское Соглашение:\n"
+            "https://telegra.ph/Polzovatelskoe-soglashenie-09-21-65\n\n"
+            "Политика Конфиденциальности:\n"
+            "https://telegra.ph/Politika-konfidencialnosti-09-21-83"
+        )
 
 app = ApplicationBuilder().token(Token).build()
 
