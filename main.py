@@ -1,22 +1,52 @@
 import os
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
-# Токен лучше не хранить прямо в коде — бери его из переменной окружения.
 Token = os.environ["BOT_TOKEN"]
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! я твой бот")
+    text = (
+        "🔷 *ELKA VPN*\n\n"
+        "🌍 От 1 Сервера\n"
+        "🔒 Без логов подключений\n"
+        "🛡 Надёжное подключение\n"
+        "⚡ Высокая скорость соединения"
+    )
 
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Купить подписку", callback_data="buy_subscription")],
+        [InlineKeyboardButton("📊 Моя подписка", callback_data="my_subscription")],
+        [
+            InlineKeyboardButton("💰 Баланс", callback_data="balance"),
+            InlineKeyboardButton("🎁 Промокод", callback_data="promo"),
+        ],
+        [InlineKeyboardButton("👥 Пригласить друзей", callback_data="invite")],
+        [InlineKeyboardButton("🆘 Поддержка", url="https://t.me/blelbu")],
+        [InlineKeyboardButton("📄 Документы", callback_data="docs")],
+    ])
 
-async def hello(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello! Как у тя дела?")
+    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()  # обязательно, иначе кнопка будет "крутиться"
+
+    if query.data == "buy_subscription":
+        await query.message.reply_text("Здесь будет процесс покупки подписки.")
+    elif query.data == "my_subscription":
+        await query.message.reply_text("Здесь будет информация о текущей подписке.")
+    elif query.data == "balance":
+        await query.message.reply_text("Ваш баланс: 0 ₽")
+    elif query.data == "promo":
+        await query.message.reply_text("Введите промокод:")
+    elif query.data == "invite":
+        await query.message.reply_text("Ваша реферальная ссылка: https://t.me/your_bot?start=ref123")
+    elif query.data == "docs":
+        await query.message.reply_text("Здесь будут ссылки на документы.")
 
 app = ApplicationBuilder().token(Token).build()
 
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("hello", hello))
+app.add_handler(CallbackQueryHandler(button_handler))  # добавь этот импорт ниже
 
 app.run_polling()
