@@ -9,8 +9,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*ELKA VPN*\n\n"
         "От 1 Сервера\n"
         "Без логов подключений\n"
-        "Надёжное подключение\n"        
-        "Высокая скорость соединения"
+        "Надёжное подключение\n"        "Высокая скорость соединения"
     )
 
     keyboard = InlineKeyboardMarkup([
@@ -25,14 +24,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📄 Документы", callback_data="docs")],
     ])
 
-    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await update.effective_message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()  # обязательно, иначе кнопка будет "крутиться"
 
     if query.data == "buy_subscription":
-        await query.message.reply_text("Скоро.")
+        plans_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("1 месяц — 80 руб", callback_data="plan_1m")],
+            [InlineKeyboardButton("3 месяца — 160 руб", callback_data="plan_3m")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
+        ])
+        await query.message.reply_text(
+            "Выберите срок подписки:",
+            reply_markup=plans_keyboard,
+        )
+    elif query.data == "plan_1m":
+        await query.message.reply_text("Вы выбрали: 1 месяц — 80 руб.\nОплата скоро будет доступна.")
+    elif query.data == "plan_3m":
+        await query.message.reply_text("Вы выбрали: 3 месяца — 160 руб.\nОплата скоро будет доступна.")
+    elif query.data == "back_to_menu":
+        await start(update, context)
     elif query.data == "my_subscription":
         await query.message.reply_text("Скоро.")
     elif query.data == "balance":
