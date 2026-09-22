@@ -6,14 +6,14 @@ Token = os.environ["BOT_TOKEN"]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "🔷 *ELKA VPN*\n\n"
-        "🌍 От 1 Сервера\n"
-        "🔒 Без логов подключений\n"
-        "🛡 Надёжное подключение\n"
-        "⚡ Высокая скорость соединения"
+        "*ELKA VPN*\n\n"
+        "От 1 Сервера\n"
+        "Без логов подключений\n"
+        "Надёжное подключение\n"
+        "Высокая скорость соединения"
     )
 
-    keyboard = InlineKeyboardMarkup([
+    keyboard = InlineKeyboardMarkup(
         [InlineKeyboardButton("💳 Купить подписку", callback_data="buy_subscription")],
         [InlineKeyboardButton("📊 Моя подписка", callback_data="my_subscription")],
         [
@@ -32,17 +32,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()  # обязательно, иначе кнопка будет "крутиться"
 
     if query.data == "buy_subscription":
-        await query.message.reply_text("Здесь будет процесс покупки подписки.")
+        await query.message.reply_text("Скоро.")
     elif query.data == "my_subscription":
-        await query.message.reply_text("Здесь будет информация о текущей подписке.")
+        await query.message.reply_text("Скоро.")
     elif query.data == "balance":
-        await query.message.reply_text("Ваш баланс: 0 ₽")
+        await query.message.reply_text("Скоро")
     elif query.data == "promo":
         await query.message.reply_text("Введите промокод:")
     elif query.data == "invite":
-        await query.message.reply_text("Ваша реферальная ссылка: https://t.me/your_bot?start=ref123")
+        await query.message.reply_text("Скоро")
     elif query.data == "docs":
-        await query.message.reply_text("Здесь будут ссылки на документы.")
+        await query.message.reply_text("Пользовательское Соглашение:"
+                                       "https://telegra.ph/Polzovatelskoe-soglashenie-09-21-65"
+                                       "Политика Конфиденциальности:"
+                                       "https://telegra.ph/Politika-konfidencialnosti-09-21-83.")
 
 app = ApplicationBuilder().token(Token).build()
 
