@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
@@ -17,6 +18,36 @@ PLANS = {
 
 CHECK_INTERVAL = 10
 MAX_CHECKS = 90  # 90 * 10 сек = 15 минут
+
+# --- База данных (хранит сумму всех успешных оплат по каждому пользователю) ---
+DB_PATH = "/data/bot_data.db"
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS balances (user_id INTEGER PRIMARY KEY, total_paid REAL NOT NULL DEFAULT 0)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def add_to_balance(user_id: int, amount: float):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO balances (user_id, total_paid) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET total_paid = total_paid + excluded.total_paid",
+        (user_id, amount),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_balance(user_id: int) -> float:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT total_paid FROM balances WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    return row[0] if row else 0.0
 
 
 # ---------- Тексты и клавиатуры меню ----------
@@ -107,6 +138,7 @@ async def check_payment_job(context: ContextTypes.DEFAULT_TYPE):
     print(f"[Platega] transaction={data['transaction_id']} status={status}")
 
     if status in ("CONFIRMED", "PAID", "SUCCESS", "SUCCEEDED"):
+        add_to_balance(data["user_id"], data["amount"])
         try:
             await context.bot.edit_message_text(
                 chat_id=data["chat_id"],
@@ -192,6 +224,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "transaction_id": payment["transactionId"],
                 "chat_id": update.effective_chat.id,
                 "message_id": query.message.message_id,
+                "user_id": query.from_user.id,
+                "amount": plan["amount"],
                 "plan_label": plan["label"],
                 "attempts": 0,
             },
@@ -206,7 +240,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Скоро.", reply_markup=back_only_keyboard())
 
     elif query.data == "balance":
-        await query.edit_message_text("Скоро", reply_markup=back_only_keyboard())
+        total = get_balance(query.from_user.id)
+        await query.edit_message_text(
+            f"💰 Всего оплачено: {total:.0f} руб.",
+            reply_markup=back_only_keyboard(),
+        )
 
     elif query.data == "promo":
         await query.edit_message_text("Введите промокод:", reply_markup=back_only_keyboard())
@@ -223,6 +261,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_only_keyboard(),
         )
 
+
+init_db()
 
 app = ApplicationBuilder().token(Token).build()
 
