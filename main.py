@@ -1,10 +1,22 @@
 import os
 import sqlite3
+from typing import Optional
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+)
 
 Token = os.environ["BOT_TOKEN"]
+
+# --- Админка ---
+# Свой числовой Telegram ID узнать можно у бота @userinfobot — пришли ему /start
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 
 # --- Platega ---
 PLATEGA_MERCHANT_ID = os.environ["PLATEGA_MERCHANT_ID"]
@@ -19,7 +31,7 @@ PLANS = {
 CHECK_INTERVAL = 10
 MAX_CHECKS = 90  # 90 * 10 сек = 15 минут
 
-# --- База данных (хранит сумму всех успешных оплат по каждому пользователю) ---
+# --- База данных ---
 DB_PATH = "/data/bot_data.db"
 
 
@@ -28,8 +40,38 @@ def init_db():
     conn.execute(
         "CREATE TABLE IF NOT EXISTS balances (user_id INTEGER PRIMARY KEY, total_paid REAL NOT NULL DEFAULT 0)"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_seen TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
     conn.commit()
     conn.close()
+
+
+def register_user(user_id: int, username: Optional[str]):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO users (user_id, username) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET username = excluded.username",
+        (user_id, username),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_all_user_ids() -> list[int]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT user_id FROM users").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def get_stats() -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    total_revenue = conn.execute("SELECT COALESCE(SUM(total_paid), 0) FROM balances").fetchone()[0]
+    paying_users = conn.execute("SELECT COUNT(*) FROM balances WHERE total_paid > 0").fetchone()[0]
+    conn.close()
+    return {"total_users": total_users, "total_revenue": total_revenue, "paying_users": paying_users}
 
 
 def add_to_balance(user_id: int, amount: float):
@@ -86,6 +128,20 @@ def plans_menu():
 
 def back_only_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]])
+
+
+def admin_menu():
+    text = "🛠 *Админ-панель*"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton("🔍 Найти пользователя", callback_data="admin_find")],
+        [InlineKeyboardButton("📢 Рассылка всем", callback_data="admin_broadcast")],
+    ])
+    return text, keyboard
+
+
+def admin_back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_back")]])
 
 
 # ---------- Platega ----------
@@ -179,13 +235,102 @@ async def check_payment_job(context: ContextTypes.DEFAULT_TYPE):
 # ---------- Хендлеры ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id, update.effective_user.username)
     text, keyboard = main_menu()
     await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return  # обычные пользователи не получают вообще никакого ответа на /admin
+    text, keyboard = admin_menu()
+    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+
+async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатия внутри админ-панели. Возвращает True, если кнопка обработана здесь."""
+    query = update.callback_query
+
+    if query.from_user.id != ADMIN_ID:
+        return False
+
+    if query.data == "admin_back":
+        text, keyboard = admin_menu()
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        return True
+
+    if query.data == "admin_stats":
+        stats = get_stats()
+        await query.edit_message_text(
+            "📊 *Статистика*\n\n"
+            f"👥 Всего пользователей: {stats['total_users']}\n"
+            f"💳 Оплативших хотя бы раз: {stats['paying_users']}\n"
+            f"💰 Общая выручка: {stats['total_revenue']:.0f} руб.",
+            reply_markup=admin_back_keyboard(),
+            parse_mode="Markdown",
+        )
+        return True
+
+    if query.data == "admin_find":
+        context.user_data["admin_awaiting"] = "find"
+        await query.edit_message_text(
+            "Пришли числовой Telegram ID пользователя, чтобы посмотреть его баланс.",
+            reply_markup=admin_back_keyboard(),
+        )
+        return True
+
+    if query.data == "admin_broadcast":
+        context.user_data["admin_awaiting"] = "broadcast"
+        await query.edit_message_text(
+            "Пришли текст сообщения — он будет отправлен всем пользователям бота.",
+            reply_markup=admin_back_keyboard(),
+        )
+        return True
+
+    return False
+
+
+async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит обычные текстовые сообщения от админа, когда он в режиме поиска/рассылки."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    awaiting = context.user_data.get("admin_awaiting")
+    if not awaiting:
+        return  # админ просто пишет боту не в контексте админки — игнорируем
+
+    context.user_data["admin_awaiting"] = None
+
+    if awaiting == "find":
+        try:
+            target_id = int(update.message.text.strip())
+        except ValueError:
+            await update.message.reply_text("Это не похоже на числовой ID. Попробуй ещё раз через /admin.")
+            return
+        total = get_balance(target_id)
+        await update.message.reply_text(f"Пользователь {target_id}: всего оплачено {total:.0f} руб.")
+
+    elif awaiting == "broadcast":
+        text = update.message.text
+        user_ids = get_all_user_ids()
+        sent, failed = 0, 0
+        for uid in user_ids:
+            try:
+                await context.bot.send_message(chat_id=uid, text=text)
+                sent += 1
+            except Exception:
+                failed += 1
+        await update.message.reply_text(f"Рассылка завершена. Доставлено: {sent}, не удалось: {failed}.")
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if query.data.startswith("admin_"):
+        handled = await admin_button_handler(update, context)
+        if handled:
+            return
 
     if query.data == "buy_subscription":
         text, keyboard = plans_menu()
@@ -267,6 +412,8 @@ init_db()
 app = ApplicationBuilder().token(Token).build()
 
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("admin", admin_command))
 app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_handler))
 
 app.run_polling()
