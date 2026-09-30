@@ -43,6 +43,22 @@ def init_db():
     conn.execute(
         "CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_seen TEXT DEFAULT CURRENT_TIMESTAMP)"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS promo_codes ("
+        "code TEXT PRIMARY KEY, "
+        "amount REAL NOT NULL, "
+        "uses_left INTEGER, "  # NULL = безлимит
+        "created_at TEXT DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS promo_redemptions ("
+        "code TEXT NOT NULL, "
+        "user_id INTEGER NOT NULL, "
+        "redeemed_at TEXT DEFAULT CURRENT_TIMESTAMP, "
+        "PRIMARY KEY (code, user_id)"
+        ")"
+    )
     conn.commit()
     conn.close()
 
@@ -92,6 +108,56 @@ def get_balance(user_id: int) -> float:
     return row[0] if row else 0.0
 
 
+def create_promo_code(code: str, amount: float, uses_left: Optional[int]):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO promo_codes (code, amount, uses_left) VALUES (?, ?, ?) "
+        "ON CONFLICT(code) DO UPDATE SET amount = excluded.amount, uses_left = excluded.uses_left",
+        (code, amount, uses_left),
+    )
+    conn.commit()
+    conn.close()
+
+
+def redeem_promo_code(code: str, user_id: int) -> tuple[bool, str]:
+    """Возвращает (успех, сообщение для пользователя)."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT amount, uses_left FROM promo_codes WHERE code = ?", (code,)).fetchone()
+
+    if row is None:
+        conn.close()
+        return False, "Такого промокода не существует."
+
+    amount, uses_left = row
+
+    already = conn.execute(
+        "SELECT 1 FROM promo_redemptions WHERE code = ? AND user_id = ?", (code, user_id)
+    ).fetchone()
+    if already:
+        conn.close()
+        return False, "Ты уже активировал(а) этот промокод раньше."
+
+    if uses_left is not None and uses_left <= 0:
+        conn.close()
+        return False, "У этого промокода закончились активации."
+
+    if uses_left is not None:
+        conn.execute("UPDATE promo_codes SET uses_left = uses_left - 1 WHERE code = ?", (code,))
+
+    conn.execute(
+        "INSERT INTO promo_redemptions (code, user_id) VALUES (?, ?)", (code, user_id)
+    )
+    conn.execute(
+        "INSERT INTO balances (user_id, total_paid) VALUES (?, 0) ON CONFLICT(user_id) DO NOTHING",
+        (user_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    add_to_balance(user_id, amount)
+    return True, f"Промокод активирован! Начислено {amount:.0f} руб."
+
+
 # ---------- Тексты и клавиатуры меню ----------
 
 def main_menu():
@@ -136,6 +202,7 @@ def admin_menu():
         [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton("🔍 Найти пользователя", callback_data="admin_find")],
         [InlineKeyboardButton("📢 Рассылка всем", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🎁 Создать промокод", callback_data="admin_create_promo")],
     ])
     return text, keyboard
 
@@ -287,11 +354,35 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return True
 
+    if query.data == "admin_create_promo":
+        context.user_data["admin_awaiting"] = "create_promo"
+        await query.edit_message_text(
+            "Пришли промокод в формате:\n\n"
+            "`КОД СУММА КОЛИЧЕСТВО`\n\n"
+            "Например: `SALE50 100 10` — код SALE50, начисляет 100 руб., можно активировать 10 раз всего.\n"
+            "Если количество не указать — промокод будет безлимитным.\n"
+            "Например просто: `SALE50 100`",
+            reply_markup=admin_back_keyboard(),
+            parse_mode="Markdown",
+        )
+        return True
+
     return False
 
 
-async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ловит обычные текстовые сообщения от админа, когда он в режиме поиска/рассылки."""
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Единый обработчик обычных текстовых сообщений: ловит и промокоды от любых
+    пользователей, и ответы админа в режиме поиска/рассылки/создания промокода."""
+
+    # --- Пользователь вводит промокод ---
+    if context.user_data.get("awaiting_promo"):
+        context.user_data["awaiting_promo"] = False
+        code = update.message.text.strip().upper()
+        success, message = redeem_promo_code(code, update.effective_user.id)
+        await update.message.reply_text(message)
+        return
+
+    # --- Дальше — только для админа ---
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -322,10 +413,41 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 failed += 1
         await update.message.reply_text(f"Рассылка завершена. Доставлено: {sent}, не удалось: {failed}.")
 
+    elif awaiting == "create_promo":
+        parts = update.message.text.strip().split()
+        if len(parts) not in (2, 3):
+            await update.message.reply_text(
+                "Неверный формат. Нужно: КОД СУММА [КОЛИЧЕСТВО]. Попробуй ещё раз через /admin."
+            )
+            return
+
+        code = parts[0].upper()
+        try:
+            amount = float(parts[1])
+        except ValueError:
+            await update.message.reply_text("Сумма должна быть числом. Попробуй ещё раз через /admin.")
+            return
+
+        uses_left = None
+        if len(parts) == 3:
+            try:
+                uses_left = int(parts[2])
+            except ValueError:
+                await update.message.reply_text("Количество активаций должно быть целым числом.")
+                return
+
+        create_promo_code(code, amount, uses_left)
+        uses_text = "безлимитный" if uses_left is None else f"{uses_left} активаций"
+        await update.message.reply_text(
+            f"✅ Промокод «{code}» создан: {amount:.0f} руб., {uses_text}."
+        )
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    context.user_data["awaiting_promo"] = False
 
     if query.data.startswith("admin_"):
         handled = await admin_button_handler(update, context)
@@ -392,6 +514,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif query.data == "promo":
+        context.user_data["awaiting_promo"] = True
         await query.edit_message_text("Введите промокод:", reply_markup=back_only_keyboard())
 
     elif query.data == "invite":
@@ -414,6 +537,6 @@ app = ApplicationBuilder().token(Token).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("admin", admin_command))
 app.add_handler(CallbackQueryHandler(button_handler))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_handler))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
 app.run_polling()
