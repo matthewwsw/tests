@@ -196,6 +196,15 @@ def back_only_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]])
 
 
+def balance_menu(total: float):
+    text = f"💰 Баланс: {total:.0f} руб."
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Пополнить", callback_data="topup")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
+    ])
+    return text, keyboard
+
+
 def admin_menu():
     text = "🛠 *Админ-панель*"
     keyboard = InlineKeyboardMarkup([
@@ -371,8 +380,60 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Единый обработчик обычных текстовых сообщений: ловит и промокоды от любых
-    пользователей, и ответы админа в режиме поиска/рассылки/создания промокода."""
+    """Единый обработчик обычных текстовых сообщений: ловит промокоды и суммы пополнения
+    от любых пользователей, и ответы админа в режиме поиска/рассылки/создания промокода."""
+
+    # --- Пользователь вводит сумму пополнения баланса ---
+    if context.user_data.get("awaiting_topup"):
+        context.user_data["awaiting_topup"] = False
+
+        raw = update.message.text.strip().replace(",", ".")
+        try:
+            amount = float(raw)
+        except ValueError:
+            await update.message.reply_text(
+                "Это не похоже на число. Открой раздел «Баланс» ещё раз и попробуй снова."
+            )
+            return
+
+        if amount <= 0:
+            await update.message.reply_text(
+                "Сумма должна быть больше нуля. Открой раздел «Баланс» ещё раз и попробуй снова."
+            )
+            return
+
+        try:
+            payment = await create_payment(amount=amount, description="Пополнение баланса ELKA VPN")
+        except Exception:
+            await update.message.reply_text("Не получилось создать платёж. Попробуй ещё раз чуть позже.")
+            return
+
+        pay_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Оплатить", url=payment["redirect"])],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
+        ])
+        sent = await update.message.reply_text(
+            f"Пополнение: {amount:.0f} руб.\n"
+            f"Нажми кнопку ниже, чтобы перейти к оплате. После оплаты бот сам зачислит сумму на баланс.",
+            reply_markup=pay_keyboard,
+        )
+
+        context.job_queue.run_repeating(
+            check_payment_job,
+            interval=CHECK_INTERVAL,
+            first=CHECK_INTERVAL,
+            data={
+                "transaction_id": payment["transactionId"],
+                "chat_id": update.effective_chat.id,
+                "message_id": sent.message_id,
+                "user_id": update.effective_user.id,
+                "amount": amount,
+                "plan_label": "Пополнение баланса",
+                "attempts": 0,
+            },
+            name=f"check_{payment['transactionId']}",
+        )
+        return
 
     # --- Пользователь вводит промокод ---
     if context.user_data.get("awaiting_promo"):
@@ -448,6 +509,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     context.user_data["awaiting_promo"] = False
+    context.user_data["awaiting_topup"] = False
 
     if query.data.startswith("admin_"):
         handled = await admin_button_handler(update, context)
@@ -508,8 +570,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "balance":
         total = get_balance(query.from_user.id)
+        text, keyboard = balance_menu(total)
+        await query.edit_message_text(text, reply_markup=keyboard)
+
+    elif query.data == "topup":
+        context.user_data["awaiting_topup"] = True
         await query.edit_message_text(
-            f"💰 Всего оплачено: {total:.0f} руб.",
+            "Напишите любую сумму, которую хотите пополнить (например: 100)",
             reply_markup=back_only_keyboard(),
         )
 
