@@ -84,10 +84,9 @@ def get_all_user_ids() -> list[int]:
 def get_stats() -> dict:
     conn = sqlite3.connect(DB_PATH)
     total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    total_revenue = conn.execute("SELECT COALESCE(SUM(total_paid), 0) FROM balances").fetchone()[0]
     paying_users = conn.execute("SELECT COUNT(*) FROM balances WHERE total_paid > 0").fetchone()[0]
     conn.close()
-    return {"total_users": total_users, "total_revenue": total_revenue, "paying_users": paying_users}
+    return {"total_users": total_users, "paying_users": paying_users}
 
 
 def add_to_balance(user_id: int, amount: float):
@@ -106,6 +105,19 @@ def get_balance(user_id: int) -> float:
     row = conn.execute("SELECT total_paid FROM balances WHERE user_id = ?", (user_id,)).fetchone()
     conn.close()
     return row[0] if row else 0.0
+
+
+def subtract_balance(user_id: int, amount: float) -> bool:
+    """Списывает сумму с баланса, если денег достаточно. Возвращает True при успехе."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(
+        "UPDATE balances SET total_paid = total_paid - ? WHERE user_id = ? AND total_paid >= ?",
+        (amount, user_id, amount),
+    )
+    success = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return success
 
 
 def create_promo_code(code: str, amount: float, uses_left: Optional[int]):
@@ -340,8 +352,7 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(
             "📊 *Статистика*\n\n"
             f"👥 Всего пользователей: {stats['total_users']}\n"
-            f"💳 Оплативших хотя бы раз: {stats['paying_users']}\n"
-            f"💰 Общая выручка: {stats['total_revenue']:.0f} руб.",
+            f"💳 Оплативших хотя бы раз: {stats['paying_users']}",
             reply_markup=admin_back_keyboard(),
             parse_mode="Markdown",
         )
@@ -522,43 +533,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data in PLANS:
         plan = PLANS[query.data]
+        user_id = query.from_user.id
+        current_balance = get_balance(user_id)
 
-        try:
-            payment = await create_payment(
-                amount=plan["amount"],
-                description=f"Подписка ELKA VPN — {plan['label']}",
-            )
-        except Exception:
+        if current_balance < plan["amount"]:
+            missing = plan["amount"] - current_balance
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Пополнить баланс", callback_data="topup")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
+            ])
             await query.edit_message_text(
-                "Не получилось создать платёж. Попробуй ещё раз чуть позже.",
+                f"Недостаточно средств на балансе.\n\n"
+                f"Тариф «{plan['label']}» стоит {plan['amount']:.0f} руб.\n"
+                f"На балансе: {current_balance:.0f} руб.\n"
+                f"Не хватает: {missing:.0f} руб.",
+                reply_markup=keyboard,
+            )
+            return
+
+        success = subtract_balance(user_id, plan["amount"])
+        if not success:
+            # На случай гонки — если баланс изменился между проверкой и списанием
+            await query.edit_message_text(
+                "Не получилось списать средства. Попробуй ещё раз.",
                 reply_markup=back_only_keyboard(),
             )
             return
 
-        pay_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 Оплатить", url=payment["redirect"])],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
-        ])
         await query.edit_message_text(
-            f"Тариф: {plan['label']} — {plan['amount']} руб.\n"
-            f"Нажми кнопку ниже, чтобы перейти к оплате. После оплаты бот сам подтвердит платёж.",
-            reply_markup=pay_keyboard,
-        )
-
-        context.job_queue.run_repeating(
-            check_payment_job,
-            interval=CHECK_INTERVAL,
-            first=CHECK_INTERVAL,
-            data={
-                "transaction_id": payment["transactionId"],
-                "chat_id": update.effective_chat.id,
-                "message_id": query.message.message_id,
-                "user_id": query.from_user.id,
-                "amount": plan["amount"],
-                "plan_label": plan["label"],
-                "attempts": 0,
-            },
-            name=f"check_{payment['transactionId']}",
+            "✅ Оплата прошла! Ожидайте дальнейшей разработки.",
+            reply_markup=back_only_keyboard(),
         )
 
     elif query.data == "back_to_menu":
