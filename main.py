@@ -551,11 +551,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        confirm_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Подтвердить оплату", callback_data=f"confirm_{query.data}")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="buy_subscription")],
+        ])
+        await query.edit_message_text(
+            f"Тариф: {plan['label']} — {plan['amount']:.0f} руб.\n"
+            f"Текущий баланс: {current_balance:.0f} руб.\n\n"
+            f"Подтвердить списание с баланса?",
+            reply_markup=confirm_keyboard,
+        )
+
+    elif query.data.startswith("confirm_") and query.data[len("confirm_"):] in PLANS:
+        plan_key = query.data[len("confirm_"):]
+        plan = PLANS[plan_key]
+        user_id = query.from_user.id
+
         success = subtract_balance(user_id, plan["amount"])
         if not success:
-            # На случай гонки — если баланс изменился между проверкой и списанием
+            # Баланс мог измениться между подтверждением и списанием (например, уже потратил в другом месте)
             await query.edit_message_text(
-                "Не получилось списать средства. Попробуй ещё раз.",
+                "Не получилось списать средства — возможно, баланс изменился. Попробуй ещё раз.",
                 reply_markup=back_only_keyboard(),
             )
             return
