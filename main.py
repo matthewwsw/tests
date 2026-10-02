@@ -2,7 +2,7 @@ import os
 import sqlite3
 from typing import Optional
 import httpx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageOriginUser
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -510,8 +510,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if awaiting == "find":
         # Если админ переслал сообщение от пользователя — берём ID прямо оттуда
-        if update.message.forward_from:
-            target_id = update.message.forward_from.id
+        if isinstance(update.message.forward_origin, MessageOriginUser):
+            target_id = update.message.forward_origin.sender_user.id
         else:
             try:
                 target_id = int(update.message.text.strip())
