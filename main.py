@@ -120,6 +120,24 @@ def subtract_balance(user_id: int, amount: float) -> bool:
     return success
 
 
+def admin_adjust_balance(user_id: int, amount: float) -> float:
+    """Принудительно изменяет баланс на сумму amount (может быть отрицательной) —
+    без проверки достаточности средств. Используется админом для ручных корректировок
+    (например, после оформления возврата в Platega). Возвращает новый баланс."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO balances (user_id, total_paid) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET total_paid = total_paid + excluded.total_paid",
+        (user_id, amount),
+    )
+    conn.commit()
+    new_balance = conn.execute(
+        "SELECT total_paid FROM balances WHERE user_id = ?", (user_id,)
+    ).fetchone()[0]
+    conn.close()
+    return new_balance
+
+
 def create_promo_code(code: str, amount: float, uses_left: Optional[int]):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -224,6 +242,7 @@ def admin_menu():
         [InlineKeyboardButton("🔍 Найти пользователя", callback_data="admin_find")],
         [InlineKeyboardButton("📢 Рассылка всем", callback_data="admin_broadcast")],
         [InlineKeyboardButton("🎁 Создать промокод", callback_data="admin_create_promo")],
+        [InlineKeyboardButton("💸 Корректировка баланса", callback_data="admin_adjust")],
     ])
     return text, keyboard
 
@@ -387,6 +406,18 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return True
 
+    if query.data == "admin_adjust":
+        context.user_data["admin_awaiting"] = "adjust"
+        await query.edit_message_text(
+            "Пришли в формате:\n\n"
+            "`ID СУММА`\n\n"
+            "Например: `123456789 -100` — спишет 100 руб. с баланса (используй при возврате в Platega).\n"
+            "Со знаком `+` или без знака — наоборот, начислит. Например: `123456789 50`",
+            reply_markup=admin_back_keyboard(),
+            parse_mode="Markdown",
+        )
+        return True
+
     return False
 
 
@@ -512,6 +543,30 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uses_text = "безлимитный" if uses_left is None else f"{uses_left} активаций"
         await update.message.reply_text(
             f"✅ Промокод «{code}» создан: {amount:.0f} руб., {uses_text}."
+        )
+
+    elif awaiting == "adjust":
+        parts = update.message.text.strip().split()
+        if len(parts) != 2:
+            await update.message.reply_text(
+                "Неверный формат. Нужно: ID СУММА. Попробуй ещё раз через /admin."
+            )
+            return
+
+        try:
+            target_id = int(parts[0])
+            delta = float(parts[1])
+        except ValueError:
+            await update.message.reply_text(
+                "ID должен быть целым числом, сумма — числом (можно со знаком -). Попробуй ещё раз через /admin."
+            )
+            return
+
+        new_balance = admin_adjust_balance(target_id, delta)
+        action = "списано" if delta < 0 else "начислено"
+        await update.message.reply_text(
+            f"Готово. У пользователя {target_id} {action} {abs(delta):.0f} руб.\n"
+            f"Текущий баланс: {new_balance:.0f} руб."
         )
 
 
