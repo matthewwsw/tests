@@ -28,6 +28,10 @@ PLANS = {
     "plan_3m": {"amount": 220, "label": "3 месяца"},
 }
 
+# --- Обязательная подписка на канал ---
+CHANNEL_USERNAME = "@realelkavpn"
+CHANNEL_URL = "https://t.me/realelkavpn"
+
 CHECK_INTERVAL = 10
 MAX_CHECKS = 90  # 90 * 10 сек = 15 минут
 
@@ -251,6 +255,26 @@ def admin_back_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_back")]])
 
 
+def subscribe_gate_menu():
+    text = (
+        "Чтобы пользоваться ботом, подпишитесь на наш канал, "
+        "а затем нажмите «Проверить подписку»."
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Канал", url=CHANNEL_URL)],
+        [InlineKeyboardButton("✅ Проверить подписку", callback_data="check_subscription")],
+    ])
+    return text, keyboard
+
+
+async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        return False
+
+
 # ---------- Platega ----------
 
 async def create_payment(amount: float, description: str) -> dict:
@@ -306,13 +330,13 @@ async def check_payment_job(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.edit_message_text(
                 chat_id=data["chat_id"],
                 message_id=data["message_id"],
-                text=f"✅ Оплата получена! Подписка «{data['plan_label']}» активирована.",
+                text="✅ Оплата получена!",
                 reply_markup=back_only_keyboard(),
             )
         except Exception:
             await context.bot.send_message(
                 chat_id=data["chat_id"],
-                text=f"✅ Оплата получена! Подписка «{data['plan_label']}» активирована.",
+                text="✅ Оплата получена!",
             )
         job.schedule_removal()
     elif status in ("EXPIRED", "FAILED", "CANCELLED", "CANCELED", "DECLINED"):
@@ -343,6 +367,12 @@ async def check_payment_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id, update.effective_user.username)
+
+    if not await is_subscribed(context, update.effective_user.id):
+        text, keyboard = subscribe_gate_menu()
+        await update.message.reply_text(text, reply_markup=keyboard)
+        return
+
     text, keyboard = main_menu()
     await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
@@ -432,6 +462,25 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return True
 
     return False
+
+
+async def notify_user_balance_change(context: ContextTypes.DEFAULT_TYPE, user_id: int, delta: float, new_balance: float):
+    """Шлёт пользователю сообщение о том, что админ изменил его баланс.
+    Если не получилось (например, пользователь ни разу не писал боту) — тихо игнорируем."""
+    if delta >= 0:
+        text = (
+            f"💰 Вам начислено {delta:.0f} руб.\n"
+            f"Текущий баланс: {new_balance:.0f} руб."
+        )
+    else:
+        text = (
+            f"⚠️ С вашего баланса списано {abs(delta):.0f} руб.\n"
+            f"Текущий баланс: {new_balance:.0f} руб."
+        )
+    try:
+        await context.bot.send_message(chat_id=user_id, text=text)
+    except Exception:
+        pass
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -599,6 +648,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Готово. У пользователя {target_id} {action} {abs(delta):.0f} руб.\n"
             f"Текущий баланс: {new_balance:.0f} руб."
         )
+        await notify_user_balance_change(context, target_id, delta, new_balance)
 
     elif awaiting == "adjust_amount":
         target_id = context.user_data.get("adjust_target_id")
@@ -617,6 +667,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Готово. Пользователю {target_id} {action} {abs(value):.0f} руб.\n"
             f"Текущий баланс: {new_balance:.0f} руб."
         )
+        await notify_user_balance_change(context, target_id, delta, new_balance)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -630,6 +681,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         handled = await admin_button_handler(update, context)
         if handled:
             return
+
+    if query.data == "check_subscription":
+        if await is_subscribed(context, query.from_user.id):
+            text, keyboard = main_menu()
+            await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        # если подписки нет — ничего не делаем, query.answer() уже вызван выше
+        return
 
     if query.data == "buy_subscription":
         text, keyboard = plans_menu()
