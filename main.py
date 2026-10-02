@@ -406,6 +406,19 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return True
 
+    if query.data.startswith("adj_plus_") or query.data.startswith("adj_minus_"):
+        sign = 1 if query.data.startswith("adj_plus_") else -1
+        target_id = int(query.data.split("_")[-1])
+        context.user_data["admin_awaiting"] = "adjust_amount"
+        context.user_data["adjust_target_id"] = target_id
+        context.user_data["adjust_sign"] = sign
+        action = "начислить" if sign == 1 else "списать"
+        await query.edit_message_text(
+            f"Сколько руб. {action} пользователю {target_id}? Пришли число.",
+            reply_markup=admin_back_keyboard(),
+        )
+        return True
+
     if query.data == "admin_adjust":
         context.user_data["admin_awaiting"] = "adjust"
         await query.edit_message_text(
@@ -496,13 +509,31 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["admin_awaiting"] = None
 
     if awaiting == "find":
-        try:
-            target_id = int(update.message.text.strip())
-        except ValueError:
-            await update.message.reply_text("Это не похоже на числовой ID. Попробуй ещё раз через /admin.")
-            return
+        # Если админ переслал сообщение от пользователя — берём ID прямо оттуда
+        if update.message.forward_from:
+            target_id = update.message.forward_from.id
+        else:
+            try:
+                target_id = int(update.message.text.strip())
+            except ValueError:
+                await update.message.reply_text(
+                    "Это не похоже на числовой ID. Пришли ID цифрами или перешли сюда "
+                    "любое сообщение от нужного пользователя."
+                )
+                return
+
         total = get_balance(target_id)
-        await update.message.reply_text(f"Пользователь {target_id}: всего оплачено {total:.0f} руб.")
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("➕ Начислить", callback_data=f"adj_plus_{target_id}"),
+                InlineKeyboardButton("➖ Списать", callback_data=f"adj_minus_{target_id}"),
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="admin_back")],
+        ])
+        await update.message.reply_text(
+            f"Пользователь {target_id}: баланс {total:.0f} руб.",
+            reply_markup=keyboard,
+        )
 
     elif awaiting == "broadcast":
         text = update.message.text
@@ -569,6 +600,24 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Текущий баланс: {new_balance:.0f} руб."
         )
 
+    elif awaiting == "adjust_amount":
+        target_id = context.user_data.get("adjust_target_id")
+        sign = context.user_data.get("adjust_sign", 1)
+
+        try:
+            value = float(update.message.text.strip().replace(",", "."))
+        except ValueError:
+            await update.message.reply_text("Это не похоже на число. Попробуй ещё раз через /admin.")
+            return
+
+        delta = abs(value) * sign
+        new_balance = admin_adjust_balance(target_id, delta)
+        action = "начислено" if sign == 1 else "списано"
+        await update.message.reply_text(
+            f"Готово. Пользователю {target_id} {action} {abs(value):.0f} руб.\n"
+            f"Текущий баланс: {new_balance:.0f} руб."
+        )
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -577,7 +626,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting_promo"] = False
     context.user_data["awaiting_topup"] = False
 
-    if query.data.startswith("admin_"):
+    if query.data.startswith("admin_") or query.data.startswith("adj_"):
         handled = await admin_button_handler(update, context)
         if handled:
             return
