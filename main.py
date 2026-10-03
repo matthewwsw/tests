@@ -103,7 +103,7 @@ def get_user_by_offset(offset: int) -> Optional[dict]:
     """Возвращает пользователя по порядковому номеру (0 — первый зарегистрированный)."""
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
-        "SELECT user_id, username, first_seen FROM users ORDER BY first_seen ASC LIMIT 1 OFFSET ?",
+        "SELECT user_id, username, first_seen FROM users ORDER BY first_seen ASC, user_id ASC LIMIT 1 OFFSET ?",
         (offset,),
     ).fetchone()
     conn.close()
@@ -526,13 +526,16 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if query.data.startswith("ucard_"):
         offset = int(query.data[len("ucard_"):])
         text, keyboard = user_card_view(offset)
-        if text is None:
-            await query.edit_message_text(
-                "Пока нет ни одного пользователя.",
-                reply_markup=admin_back_keyboard(),
-            )
-        else:
-            await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        try:
+            if text is None:
+                await query.edit_message_text(
+                    "Пока нет ни одного пользователя.",
+                    reply_markup=admin_back_keyboard(),
+                )
+            else:
+                await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        except Exception:
+            pass  # например, "message is not modified" — безопасно игнорируем
         return True
 
     if query.data == "admin_stats":
