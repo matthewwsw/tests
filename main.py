@@ -63,6 +63,13 @@ def init_db():
         "PRIMARY KEY (code, user_id)"
         ")"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS referrals ("
+        "referred_id INTEGER PRIMARY KEY, "  # каждого приглашённого считаем только один раз
+        "referrer_id INTEGER NOT NULL, "
+        "created_at TEXT DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    )
     conn.commit()
     conn.close()
 
@@ -83,6 +90,27 @@ def get_all_user_ids() -> list[int]:
     rows = conn.execute("SELECT user_id FROM users").fetchall()
     conn.close()
     return [r[0] for r in rows]
+
+
+def record_referral(referred_id: int, referrer_id: int):
+    """Запоминает, что referred_id пришёл по ссылке referrer_id.
+    Каждый приглашённый засчитывается только один раз (даже если перейдёт по ссылке снова)."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR IGNORE INTO referrals (referred_id, referrer_id) VALUES (?, ?)",
+        (referred_id, referrer_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def count_referrals(referrer_id: int) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (referrer_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 0
 
 
 def get_stats() -> dict:
@@ -255,6 +283,32 @@ def admin_back_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_back")]])
 
 
+def docs_menu():
+    text = "📄 *Документы ELKA VPN*\n\nНиже — все документы сервиса:"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛡 Политика конфиденциальности", url="https://telegra.ph/Politika-konfidencialnosti-09-21-83")],
+        [InlineKeyboardButton("📋 Условия использования", url="https://telegra.ph/Polzovatelskoe-soglashenie-09-21-65")],
+        [InlineKeyboardButton("💵 Условия возврата", url="https://telegra.ph/Usloviya-vozvrata-10-03")],
+        [InlineKeyboardButton("🔒 Политика бота", callback_data="bot_policy")],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")],
+    ])
+    return text, keyboard
+
+
+BOT_POLICY_TEXT = (
+    "🔒 Политика конфиденциальности бота Elka VPN\n\n"
+    "1. Мы храним только данные, необходимые для работы сервиса: ваш Telegram ID, username, баланс и историю покупок подписок.\n\n"
+    "2. Мы не ведём логи посещённых сайтов и не анализируем содержимое VPN-трафика.\n\n"
+    "3. Данные об оплате обрабатываются платёжным партнёром Platega согласно его правилам.\n\n"
+    "4. Данные не передаются третьим лицам, кроме случаев, предусмотренных законом.\n\n"
+    "5. Вы можете запросить удаление своих данных, обратившись в поддержку https://t.me/blelbu"
+)
+
+
+def docs_back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="docs")]])
+
+
 def subscribe_gate_menu():
     text = (
         "Чтобы пользоваться ботом, подпишитесь на наш канал, "
@@ -367,6 +421,17 @@ async def check_payment_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id, update.effective_user.username)
+
+    # Если пользователь пришёл по реферальной ссылке — запоминаем, кто его пригласил
+    if context.args:
+        payload = context.args[0]
+        if payload.startswith("ref_"):
+            try:
+                referrer_id = int(payload[len("ref_"):])
+                if referrer_id != update.effective_user.id:  # нельзя пригласить самого себя
+                    record_referral(update.effective_user.id, referrer_id)
+            except ValueError:
+                pass
 
     if not await is_subscribed(context, update.effective_user.id):
         text, keyboard = subscribe_gate_menu()
@@ -767,16 +832,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Введите промокод:", reply_markup=back_only_keyboard())
 
     elif query.data == "invite":
-        await query.edit_message_text("Скоро", reply_markup=back_only_keyboard())
-
-    elif query.data == "docs":
+        bot_username = context.bot.username
+        link = f"https://t.me/{bot_username}?start=ref_{query.from_user.id}"
+        count = count_referrals(query.from_user.id)
         await query.edit_message_text(
-            "Пользовательское Соглашение:\n"
-            "https://telegra.ph/Polzovatelskoe-soglashenie-09-21-65\n\n"
-            "Политика Конфиденциальности:\n"
-            "https://telegra.ph/Politika-konfidencialnosti-09-21-83",
+            f"👥 Ваша реферальная ссылка:\n{link}\n\n"
+            f"Приглашено друзей: {count}",
             reply_markup=back_only_keyboard(),
         )
+
+    elif query.data == "docs":
+        text, keyboard = docs_menu()
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+    elif query.data == "bot_policy":
+        await query.edit_message_text(BOT_POLICY_TEXT, reply_markup=docs_back_keyboard())
 
 
 init_db()
