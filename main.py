@@ -92,26 +92,6 @@ def get_all_user_ids() -> list[int]:
     return [r[0] for r in rows]
 
 
-def get_user_count() -> int:
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
-    conn.close()
-    return row[0] if row else 0
-
-
-def get_user_by_offset(offset: int) -> Optional[dict]:
-    """Возвращает пользователя по порядковому номеру (0 — первый зарегистрированный)."""
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        "SELECT user_id, username, first_seen FROM users ORDER BY first_seen ASC, user_id ASC LIMIT 1 OFFSET ?",
-        (offset,),
-    ).fetchone()
-    conn.close()
-    if row is None:
-        return None
-    return {"user_id": row[0], "username": row[1], "first_seen": row[2]}
-
-
 def record_referral(referred_id: int, referrer_id: int):
     """Запоминает, что referred_id пришёл по ссылке referrer_id.
     Каждый приглашённый засчитывается только один раз (даже если перейдёт по ссылке снова)."""
@@ -292,7 +272,6 @@ def admin_menu():
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton("🔍 Найти пользователя", callback_data="admin_find")],
-        [InlineKeyboardButton("👥 Пользователи", callback_data="ucard_0")],
         [InlineKeyboardButton("📢 Рассылка всем", callback_data="admin_broadcast")],
         [InlineKeyboardButton("🎁 Создать промокод", callback_data="admin_create_promo")],
         [InlineKeyboardButton("💸 Корректировка баланса", callback_data="admin_adjust")],
@@ -302,47 +281,6 @@ def admin_menu():
 
 def admin_back_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_back")]])
-
-
-def user_card_view(offset: int):
-    """Строит текст и клавиатуру карточки пользователя по порядковому номеру.
-    Возвращает (text, keyboard) или (None, None), если пользователей вообще нет."""
-    total = get_user_count()
-    if total == 0:
-        return None, None
-
-    offset = max(0, min(offset, total - 1))  # не выходим за границы списка
-    user = get_user_by_offset(offset)
-
-    balance = get_balance(user["user_id"])
-    referrals = count_referrals(user["user_id"])
-    username_text = f"@{user['username']}" if user["username"] else "—"
-
-    text = (
-        f"👤 *Карточка пользователя* ({offset + 1}/{total})\n\n"
-        f"ID: `{user['user_id']}`\n"
-        f"Username: {username_text}\n"
-        f"Регистрация: {user['first_seen']}\n"
-        f"Баланс: {balance:.0f} руб.\n"
-        f"Приглашено друзей: {referrals}"
-    )
-
-    nav_row = []
-    if offset > 0:
-        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"ucard_{offset - 1}"))
-    if offset < total - 1:
-        nav_row.append(InlineKeyboardButton("➡️", callback_data=f"ucard_{offset + 1}"))
-
-    rows = []
-    if nav_row:
-        rows.append(nav_row)
-    rows.append([
-        InlineKeyboardButton("➕ Начислить", callback_data=f"adj_plus_{user['user_id']}"),
-        InlineKeyboardButton("➖ Списать", callback_data=f"adj_minus_{user['user_id']}"),
-    ])
-    rows.append([InlineKeyboardButton("⬅️ В меню админки", callback_data="admin_back")])
-
-    return text, InlineKeyboardMarkup(rows)
 
 
 def docs_menu():
@@ -523,20 +461,6 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
         return True
 
-    if query.data.startswith("ucard_"):
-        offset = int(query.data[len("ucard_"):])
-        text, keyboard = user_card_view(offset)
-        try:
-            if text is None:
-                await query.edit_message_text(
-                    "Пока нет ни одного пользователя.",
-                    reply_markup=admin_back_keyboard(),
-                )
-            else:
-                await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
-        except Exception:
-            pass  # например, "message is not modified" — безопасно игнорируем
-        return True
 
     if query.data == "admin_stats":
         stats = get_stats()
@@ -819,7 +743,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting_promo"] = False
     context.user_data["awaiting_topup"] = False
 
-    if query.data.startswith("admin_") or query.data.startswith("adj_") or query.data.startswith("ucard_"):
+    if query.data.startswith("admin_") or query.data.startswith("adj_"):
         handled = await admin_button_handler(update, context)
         if handled:
             return
