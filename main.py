@@ -1,5 +1,9 @@
 import os
 import sqlite3
+import json
+import uuid
+import time
+from datetime import datetime, timedelta
 from typing import Optional
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageOriginUser
@@ -24,9 +28,37 @@ PLATEGA_SECRET = os.environ["PLATEGA_SECRET"]
 PLATEGA_BASE_URL = "https://app.platega.io"
 
 PLANS = {
-    "plan_1m": {"amount": 80, "label": "1 месяц"},
-    "plan_3m": {"amount": 220, "label": "3 месяца"},
+    "plan_1m": {"amount": 80, "label": "1 месяц", "days": 30},
+    "plan_3m": {"amount": 220, "label": "3 месяца", "days": 90},
 }
+
+# --- H1Cloud VPN API (выдача VPN-доступа) ---
+H1CLOUD_API_URL = os.environ["H1CLOUD_API_URL"].rstrip("/")  # например http://de13.h1cloud.net:25053
+H1CLOUD_API_KEY = os.environ["H1CLOUD_API_KEY"]
+
+
+async def h1cloud_create_client(telegram_user_id: int, days: int) -> str:
+    """Создаёт нового клиента в H1Cloud VPN API и возвращает его персональную
+    ссылку-подписку (sub_url). Бросает исключение при любой ошибке."""
+    name = f"tg{telegram_user_id}_{int(time.time())}"  # уникально даже при продлении
+
+    async with httpx.AsyncClient(timeout=15) as http:
+        resp = await http.post(
+            f"{H1CLOUD_API_URL}/create",
+            headers={"X-API-Key": H1CLOUD_API_KEY, "Content-Type": "application/json"},
+            json={"name": name, "days": days},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    if not data.get("ok"):
+        raise RuntimeError(data.get("error", "H1Cloud create failed"))
+
+    sub_url = data.get("client", {}).get("sub_url")
+    if not sub_url:
+        raise RuntimeError("H1Cloud не вернул sub_url")
+    return sub_url
+
 
 # --- Обязательная подписка на канал ---
 CHANNEL_USERNAME = "@realelkavpn"
@@ -391,6 +423,7 @@ async def check_payment_job(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=data["chat_id"],
                 text="✅ Оплата получена!",
+                reply_markup=back_only_keyboard(),
             )
         job.schedule_removal()
     elif status in ("EXPIRED", "FAILED", "CANCELLED", "CANCELED", "DECLINED"):
@@ -544,7 +577,7 @@ async def notify_user_balance_change(context: ContextTypes.DEFAULT_TYPE, user_id
             f"Текущий баланс: {new_balance:.0f} руб."
         )
     try:
-        await context.bot.send_message(chat_id=user_id, text=text)
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=back_only_keyboard())
     except Exception:
         pass
 
@@ -562,20 +595,25 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount = float(raw)
         except ValueError:
             await update.message.reply_text(
-                "Это не похоже на число. Открой раздел «Баланс» ещё раз и попробуй снова."
+                "Это не похоже на число. Открой раздел «Баланс» ещё раз и попробуй снова.",
+                reply_markup=back_only_keyboard(),
             )
             return
 
         if amount <= 0:
             await update.message.reply_text(
-                "Сумма должна быть больше нуля. Открой раздел «Баланс» ещё раз и попробуй снова."
+                "Сумма должна быть больше нуля. Открой раздел «Баланс» ещё раз и попробуй снова.",
+                reply_markup=back_only_keyboard(),
             )
             return
 
         try:
             payment = await create_payment(amount=amount, description="Пополнение баланса ELKA VPN")
         except Exception:
-            await update.message.reply_text("Не получилось создать платёж. Попробуй ещё раз чуть позже.")
+            await update.message.reply_text(
+                "Не получилось создать платёж. Попробуй ещё раз чуть позже.",
+                reply_markup=back_only_keyboard(),
+            )
             return
 
         pay_keyboard = InlineKeyboardMarkup([
@@ -610,7 +648,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_promo"] = False
         code = update.message.text.strip().upper()
         success, message = redeem_promo_code(code, update.effective_user.id)
-        await update.message.reply_text(message)
+        await update.message.reply_text(message, reply_markup=back_only_keyboard())
         return
 
     # --- Дальше — только для админа ---
@@ -633,7 +671,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 await update.message.reply_text(
                     "Это не похоже на числовой ID. Пришли ID цифрами или перешли сюда "
-                    "любое сообщение от нужного пользователя."
+                    "любое сообщение от нужного пользователя.",
+                    reply_markup=admin_back_keyboard(),
                 )
                 return
 
@@ -660,13 +699,17 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sent += 1
             except Exception:
                 failed += 1
-        await update.message.reply_text(f"Рассылка завершена. Доставлено: {sent}, не удалось: {failed}.")
+        await update.message.reply_text(
+            f"Рассылка завершена. Доставлено: {sent}, не удалось: {failed}.",
+            reply_markup=admin_back_keyboard(),
+        )
 
     elif awaiting == "create_promo":
         parts = update.message.text.strip().split()
         if len(parts) not in (2, 3):
             await update.message.reply_text(
-                "Неверный формат. Нужно: КОД СУММА [КОЛИЧЕСТВО]. Попробуй ещё раз через /admin."
+                "Неверный формат. Нужно: КОД СУММА [КОЛИЧЕСТВО]. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
             )
             return
 
@@ -674,7 +717,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             amount = float(parts[1])
         except ValueError:
-            await update.message.reply_text("Сумма должна быть числом. Попробуй ещё раз через /admin.")
+            await update.message.reply_text(
+                "Сумма должна быть числом. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
             return
 
         uses_left = None
@@ -682,20 +728,25 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 uses_left = int(parts[2])
             except ValueError:
-                await update.message.reply_text("Количество активаций должно быть целым числом.")
+                await update.message.reply_text(
+                    "Количество активаций должно быть целым числом.",
+                    reply_markup=admin_back_keyboard(),
+                )
                 return
 
         create_promo_code(code, amount, uses_left)
         uses_text = "безлимитный" if uses_left is None else f"{uses_left} активаций"
         await update.message.reply_text(
-            f"✅ Промокод «{code}» создан: {amount:.0f} руб., {uses_text}."
+            f"✅ Промокод «{code}» создан: {amount:.0f} руб., {uses_text}.",
+            reply_markup=admin_back_keyboard(),
         )
 
     elif awaiting == "adjust":
         parts = update.message.text.strip().split()
         if len(parts) != 2:
             await update.message.reply_text(
-                "Неверный формат. Нужно: ID СУММА. Попробуй ещё раз через /admin."
+                "Неверный формат. Нужно: ID СУММА. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
             )
             return
 
@@ -704,7 +755,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             delta = float(parts[1])
         except ValueError:
             await update.message.reply_text(
-                "ID должен быть целым числом, сумма — числом (можно со знаком -). Попробуй ещё раз через /admin."
+                "ID должен быть целым числом, сумма — числом (можно со знаком -). Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
             )
             return
 
@@ -712,7 +764,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = "списано" if delta < 0 else "начислено"
         await update.message.reply_text(
             f"Готово. У пользователя {target_id} {action} {abs(delta):.0f} руб.\n"
-            f"Текущий баланс: {new_balance:.0f} руб."
+            f"Текущий баланс: {new_balance:.0f} руб.",
+            reply_markup=admin_back_keyboard(),
         )
         await notify_user_balance_change(context, target_id, delta, new_balance)
 
@@ -723,7 +776,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             value = float(update.message.text.strip().replace(",", "."))
         except ValueError:
-            await update.message.reply_text("Это не похоже на число. Попробуй ещё раз через /admin.")
+            await update.message.reply_text(
+                "Это не похоже на число. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
             return
 
         delta = abs(value) * sign
@@ -731,7 +787,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = "начислено" if sign == 1 else "списано"
         await update.message.reply_text(
             f"Готово. Пользователю {target_id} {action} {abs(value):.0f} руб.\n"
-            f"Текущий баланс: {new_balance:.0f} руб."
+            f"Текущий баланс: {new_balance:.0f} руб.",
+            reply_markup=admin_back_keyboard(),
         )
         await notify_user_balance_change(context, target_id, delta, new_balance)
 
@@ -804,10 +861,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        await query.edit_message_text(
-            "✅ Оплата прошла! Ожидайте дальнейшей разработки.",
-            reply_markup=back_only_keyboard(),
-        )
+        try:
+            sub_url = await h1cloud_create_client(user_id, plan["days"])
+            text = (
+                "✅ Оплата прошла!\n\n"
+                "Ваша персональная ссылка-подписка:\n"
+                f"{sub_url}\n\n"
+                "Добавьте эту ссылку в приложение (v2rayNG, NekoBox, Happ, Streisand и т.п.) — "
+                "там появятся все доступные сервера."
+            )
+        except Exception:
+            # Деньги уже списаны — возвращаем их, раз ключ выдать не получилось
+            admin_adjust_balance(user_id, plan["amount"])
+            text = (
+                "Оплата прошла, но не получилось автоматически выдать ключ. "
+                "Деньги возвращены на баланс — попробуйте ещё раз чуть позже или напишите в поддержку."
+            )
+
+        await query.edit_message_text(text, reply_markup=back_only_keyboard())
 
     elif query.data == "back_to_menu":
         text, keyboard = main_menu()
