@@ -37,10 +37,10 @@ H1CLOUD_API_URL = os.environ["H1CLOUD_API_URL"].rstrip("/")  # например 
 H1CLOUD_API_KEY = os.environ["H1CLOUD_API_KEY"]
 
 
-async def h1cloud_create_client(telegram_user_id: int, days: int) -> str:
-    """Создаёт нового клиента в H1Cloud VPN API и возвращает его персональную
-    ссылку-подписку (sub_url). Бросает исключение при любой ошибке."""
-    name = f"tg{telegram_user_id}_{int(time.time())}"  # уникально даже при продлении
+async def h1cloud_create_client(telegram_user_id: int, days: int) -> dict:
+    """Создаёт нового клиента в H1Cloud VPN API и возвращает весь объект client
+    (включая name, sub_url, left_days, traffic_used_gb и т.д.). Бросает исключение при ошибке."""
+    name = f"ElkaVPN_{telegram_user_id}_{int(time.time())}"  # уникально даже при продлении
 
     async with httpx.AsyncClient(timeout=15) as http:
         resp = await http.post(
@@ -54,10 +54,49 @@ async def h1cloud_create_client(telegram_user_id: int, days: int) -> str:
     if not data.get("ok"):
         raise RuntimeError(data.get("error", "H1Cloud create failed"))
 
-    sub_url = data.get("client", {}).get("sub_url")
-    if not sub_url:
-        raise RuntimeError("H1Cloud не вернул sub_url")
-    return sub_url
+    client = data.get("client")
+    if not client or not client.get("sub_url"):
+        raise RuntimeError("H1Cloud не вернул client/sub_url")
+    return client
+
+
+async def h1cloud_get_client_info(name: str) -> dict:
+    """Запрашивает у H1Cloud актуальные данные по уже существующему клиенту
+    (сколько дней и трафика осталось, статус и т.д.). Бросает исключение при ошибке."""
+    async with httpx.AsyncClient(timeout=15) as http:
+        resp = await http.get(
+            f"{H1CLOUD_API_URL}/info",
+            headers={"X-API-Key": H1CLOUD_API_KEY},
+            params={"name": name},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    if not data.get("ok"):
+        raise RuntimeError(data.get("error", "H1Cloud info failed"))
+
+    client = data.get("client")
+    if not client:
+        raise RuntimeError("H1Cloud не вернул client")
+    return client
+
+
+def save_vpn_client(user_id: int, name: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO vpn_clients (user_id, name) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET name = excluded.name, updated_at = CURRENT_TIMESTAMP",
+        (user_id, name),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_vpn_client_name(user_id: int) -> Optional[str]:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT name FROM vpn_clients WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
 # --- Обязательная подписка на канал ---
@@ -78,6 +117,13 @@ def init_db():
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_seen TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS vpn_clients ("
+        "user_id INTEGER PRIMARY KEY, "  # у каждого пользователя один актуальный VPN-аккаунт
+        "name TEXT NOT NULL, "           # имя клиента в H1Cloud
+        "updated_at TEXT DEFAULT CURRENT_TIMESTAMP"
+        ")"
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS promo_codes ("
@@ -862,11 +908,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            sub_url = await h1cloud_create_client(user_id, plan["days"])
+            client = await h1cloud_create_client(user_id, plan["days"])
+            save_vpn_client(user_id, client["name"])
             text = (
                 "✅ Оплата прошла!\n\n"
                 "Ваша персональная ссылка-подписка:\n"
-                f"{sub_url}\n\n"
+                f"{client['sub_url']}\n\n"
                 "Добавьте эту ссылку в приложение (v2rayNG, NekoBox, Happ, Streisand и т.п.) — "
                 "там появятся все доступные сервера."
             )
@@ -885,7 +932,51 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
     elif query.data == "my_subscription":
-        await query.edit_message_text("Скоро.", reply_markup=back_only_keyboard())
+        vpn_name = get_vpn_client_name(query.from_user.id)
+
+        if not vpn_name:
+            await query.edit_message_text(
+                "❌ Срок подписки истёк.\n\nОформите новую, чтобы снова получить доступ к VPN.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💳 Купить подписку", callback_data="buy_subscription")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
+                ]),
+            )
+            return
+
+        try:
+            client = await h1cloud_get_client_info(vpn_name)
+        except Exception:
+            await query.edit_message_text(
+                "Не получилось получить данные о подписке. Попробуйте ещё раз чуть позже.",
+                reply_markup=back_only_keyboard(),
+            )
+            return
+
+        left_days = client.get("left_days", 0)
+
+        if left_days <= 0 or client.get("status") != "active":
+            await query.edit_message_text(
+                "❌ Срок подписки истёк.\n\nОформите новую, чтобы снова получить доступ к VPN.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💳 Купить подписку", callback_data="buy_subscription")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
+                ]),
+            )
+            return
+
+        used_gb = client.get("traffic_used_gb", 0.0)
+        limit_gb = client.get("traffic_limit_gb", 0.0)
+        limit_text = f"{limit_gb:.1f} ГБ" if limit_gb else "безлимит"
+
+        text = (
+            "📊 *Моя подписка*\n\n"
+            f"Осталось дней: {left_days}\n"
+            f"Трафик использован: {used_gb:.2f} ГБ из {limit_text}\n\n"
+            "Ссылка-подписка:\n"
+            f"{client['sub_url']}"
+        )
+        await query.edit_message_text(text, reply_markup=back_only_keyboard(), parse_mode="Markdown")
 
     elif query.data == "balance":
         total = get_balance(query.from_user.id)
