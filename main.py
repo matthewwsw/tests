@@ -133,6 +133,18 @@ def init_db():
         "created_at TEXT DEFAULT CURRENT_TIMESTAMP"
         ")"
     )
+    try:
+        # 'balance' — начисляет деньги на баланс, 'discount' — скидка в процентах на подписку
+        conn.execute("ALTER TABLE promo_codes ADD COLUMN kind TEXT NOT NULL DEFAULT 'balance'")
+    except sqlite3.OperationalError:
+        pass  # колонка уже существует
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS user_discounts ("
+        "user_id INTEGER PRIMARY KEY, "  # у пользователя одна активная скидка на следующую покупку
+        "code TEXT NOT NULL, "
+        "percent INTEGER NOT NULL"
+        ")"
+    )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS promo_redemptions ("
         "code TEXT NOT NULL, "
@@ -195,8 +207,32 @@ def get_stats() -> dict:
     conn = sqlite3.connect(DB_PATH)
     total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     paying_users = conn.execute("SELECT COUNT(*) FROM balances WHERE total_paid > 0").fetchone()[0]
+    total_referrals = conn.execute("SELECT COUNT(*) FROM referrals").fetchone()[0]
+    active_subs = conn.execute("SELECT COUNT(*) FROM vpn_clients").fetchone()[0]
     conn.close()
-    return {"total_users": total_users, "paying_users": paying_users}
+    return {
+        "total_users": total_users,
+        "paying_users": paying_users,
+        "total_referrals": total_referrals,
+        "active_subs": active_subs,
+    }
+
+
+def get_promo_codes_list(limit: int = 30) -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT code, amount, uses_left, kind FROM promo_codes ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [{"code": r[0], "amount": r[1], "uses_left": r[2], "kind": r[3]} for r in rows]
+
+
+def count_promo_codes() -> int:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT COUNT(*) FROM promo_codes").fetchone()
+    conn.close()
+    return row[0] if row else 0
 
 
 def add_to_balance(user_id: int, amount: float):
@@ -248,27 +284,64 @@ def admin_adjust_balance(user_id: int, amount: float) -> float:
     return new_balance
 
 
-def create_promo_code(code: str, amount: float, uses_left: Optional[int]):
+def create_promo_code(code: str, amount: float, uses_left: Optional[int], kind: str = "balance"):
+    """kind='balance': amount — сумма в рублях; kind='discount': amount — процент скидки."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO promo_codes (code, amount, uses_left) VALUES (?, ?, ?) "
-        "ON CONFLICT(code) DO UPDATE SET amount = excluded.amount, uses_left = excluded.uses_left",
-        (code, amount, uses_left),
+        "INSERT INTO promo_codes (code, amount, uses_left, kind) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(code) DO UPDATE SET amount = excluded.amount, "
+        "uses_left = excluded.uses_left, kind = excluded.kind",
+        (code, amount, uses_left, kind),
     )
     conn.commit()
     conn.close()
 
 
+def set_user_discount(user_id: int, code: str, percent: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO user_discounts (user_id, code, percent) VALUES (?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET code = excluded.code, percent = excluded.percent",
+        (user_id, code, percent),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_discount(user_id: int) -> int:
+    """Возвращает процент активной скидки пользователя (0, если скидки нет)."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT percent FROM user_discounts WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def clear_user_discount(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM user_discounts WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def discounted_price(amount: float, percent: int) -> int:
+    """Цена с учётом скидки, округлённая до целых рублей (минимум 1 руб.)."""
+    if percent <= 0:
+        return int(amount)
+    return max(1, round(amount * (100 - percent) / 100))
+
+
 def redeem_promo_code(code: str, user_id: int) -> tuple[bool, str]:
     """Возвращает (успех, сообщение для пользователя)."""
     conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT amount, uses_left FROM promo_codes WHERE code = ?", (code,)).fetchone()
+    row = conn.execute(
+        "SELECT amount, uses_left, kind FROM promo_codes WHERE code = ?", (code,)
+    ).fetchone()
 
     if row is None:
         conn.close()
         return False, "Такого промокода не существует."
 
-    amount, uses_left = row
+    amount, uses_left, kind = row
 
     already = conn.execute(
         "SELECT 1 FROM promo_redemptions WHERE code = ? AND user_id = ?", (code, user_id)
@@ -293,6 +366,14 @@ def redeem_promo_code(code: str, user_id: int) -> tuple[bool, str]:
     )
     conn.commit()
     conn.close()
+
+    if kind == "discount":
+        percent = int(amount)
+        set_user_discount(user_id, code, percent)
+        return True, (
+            f"Промокод активирован! Скидка {percent}% будет применена "
+            f"к вашей следующей покупке подписки."
+        )
 
     add_to_balance(user_id, amount)
     return True, f"Промокод активирован! Начислено {amount:.0f} руб."
@@ -322,14 +403,18 @@ def main_menu():
     return text, keyboard
 
 
-def plans_menu():
+def plans_menu(discount_percent: int = 0):
     text = "Выберите срок подписки:"
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("1 месяц — 80 руб", callback_data="plan_1m")],
-        [InlineKeyboardButton("3 месяца — 220 руб", callback_data="plan_3m")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
-    ])
-    return text, keyboard
+    if discount_percent > 0:
+        text += f"\n\n🏷 Ваша скидка {discount_percent}% применена к ценам ниже."
+
+    rows = []
+    for key, plan in PLANS.items():
+        price = discounted_price(plan["amount"], discount_percent)
+        suffix = f" (−{discount_percent}%)" if discount_percent > 0 else ""
+        rows.append([InlineKeyboardButton(f"{plan['label']} — {price} руб{suffix}", callback_data=key)])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")])
+    return text, InlineKeyboardMarkup(rows)
 
 
 def back_only_keyboard():
@@ -351,8 +436,10 @@ def admin_menu():
         [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton("🔍 Найти пользователя", callback_data="admin_find")],
         [InlineKeyboardButton("📢 Рассылка всем", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("🎁 Создать промокод", callback_data="admin_create_promo")],
+        [InlineKeyboardButton("🎁 Создать промокод (деньги)", callback_data="admin_create_promo")],
+        [InlineKeyboardButton("🏷 Создать промокод (скидка %)", callback_data="admin_create_discount")],
         [InlineKeyboardButton("💸 Корректировка баланса", callback_data="admin_adjust")],
+        [InlineKeyboardButton("🎟 Список промокодов", callback_data="admin_promo_list")],
     ])
     return text, keyboard
 
@@ -524,6 +611,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return  # обычные пользователи не получают вообще никакого ответа на /admin
+    context.user_data["admin_awaiting"] = None  # та же защита, что и в admin_button_handler
     text, keyboard = admin_menu()
     await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
@@ -535,18 +623,23 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if query.from_user.id != ADMIN_ID:
         return False
 
+    # Любое нажатие в админке сбрасывает незавершённый сценарий ввода текста —
+    # иначе случайное сообщение могло попасть в старый, уже брошенный диалог.
+    context.user_data["admin_awaiting"] = None
+
     if query.data == "admin_back":
         text, keyboard = admin_menu()
         await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
         return True
-
 
     if query.data == "admin_stats":
         stats = get_stats()
         await query.edit_message_text(
             "📊 *Статистика*\n\n"
             f"👥 Всего пользователей: {stats['total_users']}\n"
-            f"💳 Оплативших хотя бы раз: {stats['paying_users']}",
+            f"💳 Оплативших хотя бы раз: {stats['paying_users']}\n"
+            f"🔌 Активных VPN-аккаунтов: {stats['active_subs']}\n"
+            f"👥 Всего рефералов: {stats['total_referrals']}",
             reply_markup=admin_back_keyboard(),
             parse_mode="Markdown",
         )
@@ -565,6 +658,21 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(
             "Пришли текст сообщения — он будет отправлен всем пользователям бота.",
             reply_markup=admin_back_keyboard(),
+        )
+        return True
+
+    if query.data == "admin_create_discount":
+        context.user_data["admin_awaiting"] = "create_discount"
+        await query.edit_message_text(
+            "Пришли промокод на скидку в формате:\n\n"
+            "`КОД ПРОЦЕНТ КОЛИЧЕСТВО`\n\n"
+            "Например: `SALE20 20 50` — скидка 20% на следующую покупку подписки, "
+            "можно активировать 50 раз всего.\n"
+            "Если количество не указать — промокод будет безлимитным.\n"
+            "Например просто: `SALE20 20`\n\n"
+            "Процент — целое число от 1 до 99.",
+            reply_markup=admin_back_keyboard(),
+            parse_mode="Markdown",
         )
         return True
 
@@ -592,6 +700,27 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Сколько руб. {action} пользователю {target_id}? Пришли число.",
             reply_markup=admin_back_keyboard(),
         )
+        return True
+
+    if query.data == "admin_promo_list":
+        codes = get_promo_codes_list()
+        total = count_promo_codes()
+        if not codes:
+            await query.edit_message_text("Промокодов пока нет.", reply_markup=admin_back_keyboard())
+            return True
+
+        lines = []
+        for c in codes:
+            if c["kind"] == "discount":
+                value_text = f"скидка {int(c['amount'])}%"
+            else:
+                value_text = f"{c['amount']:.0f} руб."
+            uses_text = "безлимит" if c["uses_left"] is None else f"осталось {c['uses_left']}"
+            lines.append(f"`{c['code']}` — {value_text}, {uses_text}")
+
+        shown_note = f" (последние {len(codes)} из {total})" if total > len(codes) else ""
+        text = f"🎟 *Промокоды*{shown_note}:\n\n" + "\n".join(lines)
+        await query.edit_message_text(text, reply_markup=admin_back_keyboard(), parse_mode="Markdown")
         return True
 
     if query.data == "admin_adjust":
@@ -723,6 +852,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         total = get_balance(target_id)
+        referrals = count_referrals(target_id)
+        discount = get_user_discount(target_id)
+        discount_line = f"\nАктивная скидка: {discount}%" if discount > 0 else ""
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("➕ Начислить", callback_data=f"adj_plus_{target_id}"),
@@ -731,7 +863,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅️ Назад", callback_data="admin_back")],
         ])
         await update.message.reply_text(
-            f"Пользователь {target_id}: баланс {total:.0f} руб.",
+            f"Пользователь {target_id}\n"
+            f"Баланс: {total:.0f} руб.\n"
+            f"Приглашено друзей: {referrals}"
+            f"{discount_line}",
             reply_markup=keyboard,
         )
 
@@ -769,6 +904,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if amount <= 0:
+            await update.message.reply_text(
+                "Сумма промокода должна быть больше нуля.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
         uses_left = None
         if len(parts) == 3:
             try:
@@ -779,11 +921,67 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=admin_back_keyboard(),
                 )
                 return
+            if uses_left < 1:
+                await update.message.reply_text(
+                    "Количество активаций должно быть не меньше 1 (или не указывай его совсем для безлимита).",
+                    reply_markup=admin_back_keyboard(),
+                )
+                return
 
         create_promo_code(code, amount, uses_left)
         uses_text = "безлимитный" if uses_left is None else f"{uses_left} активаций"
         await update.message.reply_text(
             f"✅ Промокод «{code}» создан: {amount:.0f} руб., {uses_text}.",
+            reply_markup=admin_back_keyboard(),
+        )
+
+    elif awaiting == "create_discount":
+        parts = update.message.text.strip().split()
+        if len(parts) not in (2, 3):
+            await update.message.reply_text(
+                "Неверный формат. Нужно: КОД ПРОЦЕНТ [КОЛИЧЕСТВО]. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        code = parts[0].upper()
+        try:
+            percent = int(parts[1])
+        except ValueError:
+            await update.message.reply_text(
+                "Процент должен быть целым числом. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        if not 1 <= percent <= 99:
+            await update.message.reply_text(
+                "Процент должен быть от 1 до 99. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        uses_left = None
+        if len(parts) == 3:
+            try:
+                uses_left = int(parts[2])
+            except ValueError:
+                await update.message.reply_text(
+                    "Количество активаций должно быть целым числом.",
+                    reply_markup=admin_back_keyboard(),
+                )
+                return
+            if uses_left < 1:
+                await update.message.reply_text(
+                    "Количество активаций должно быть не меньше 1 (или не указывай его совсем для безлимита).",
+                    reply_markup=admin_back_keyboard(),
+                )
+                return
+
+        create_promo_code(code, percent, uses_left, kind="discount")
+        uses_text = "безлимитный" if uses_left is None else f"{uses_left} активаций"
+        await update.message.reply_text(
+            f"✅ Промокод на скидку «{code}» создан: {percent}%, {uses_text}.",
             reply_markup=admin_back_keyboard(),
         )
 
@@ -806,6 +1004,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if delta == 0:
+            await update.message.reply_text(
+                "Сумма не может быть нулевой. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
         new_balance = admin_adjust_balance(target_id, delta)
         action = "списано" if delta < 0 else "начислено"
         await update.message.reply_text(
@@ -824,6 +1029,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text(
                 "Это не похоже на число. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        if value == 0:
+            await update.message.reply_text(
+                "Сумма не может быть нулевой. Попробуй ещё раз через /admin.",
                 reply_markup=admin_back_keyboard(),
             )
             return
@@ -859,23 +1071,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "buy_subscription":
-        text, keyboard = plans_menu()
+        text, keyboard = plans_menu(get_user_discount(query.from_user.id))
         await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
     elif query.data in PLANS:
         plan = PLANS[query.data]
         user_id = query.from_user.id
         current_balance = get_balance(user_id)
+        discount = get_user_discount(user_id)
+        price = discounted_price(plan["amount"], discount)
+        discount_note = f" (скидка {discount}%, вместо {plan['amount']:.0f} руб.)" if discount > 0 else ""
 
-        if current_balance < plan["amount"]:
-            missing = plan["amount"] - current_balance
+        if current_balance < price:
+            missing = price - current_balance
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Пополнить баланс", callback_data="topup")],
                 [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
             ])
             await query.edit_message_text(
                 f"Недостаточно средств на балансе.\n\n"
-                f"Тариф «{plan['label']}» стоит {plan['amount']:.0f} руб.\n"
+                f"Тариф «{plan['label']}» стоит {price} руб.{discount_note}\n"
                 f"На балансе: {current_balance:.0f} руб.\n"
                 f"Не хватает: {missing:.0f} руб.",
                 reply_markup=keyboard,
@@ -887,7 +1102,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("❌ Отмена", callback_data="buy_subscription")],
         ])
         await query.edit_message_text(
-            f"Тариф: {plan['label']} — {plan['amount']:.0f} руб.\n"
+            f"Тариф: {plan['label']} — {price} руб.{discount_note}\n"
             f"Текущий баланс: {current_balance:.0f} руб.\n\n"
             f"Подтвердить списание с баланса?",
             reply_markup=confirm_keyboard,
@@ -897,8 +1112,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plan_key = query.data[len("confirm_"):]
         plan = PLANS[plan_key]
         user_id = query.from_user.id
+        price = discounted_price(plan["amount"], get_user_discount(user_id))  # пересчитываем на сервере
 
-        success = subtract_balance(user_id, plan["amount"])
+        success = subtract_balance(user_id, price)
         if not success:
             # Баланс мог измениться между подтверждением и списанием (например, уже потратил в другом месте)
             await query.edit_message_text(
@@ -910,6 +1126,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             client = await h1cloud_create_client(user_id, plan["days"])
             save_vpn_client(user_id, client["name"])
+            clear_user_discount(user_id)  # скидка одноразовая — гасим только после успешной выдачи ключа
             text = (
                 "✅ Оплата прошла!\n\n"
                 "Ваша персональная ссылка-подписка:\n"
@@ -919,7 +1136,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             # Деньги уже списаны — возвращаем их, раз ключ выдать не получилось
-            admin_adjust_balance(user_id, plan["amount"])
+            admin_adjust_balance(user_id, price)
             text = (
                 "Оплата прошла, но не получилось автоматически выдать ключ. "
                 "Деньги возвращены на баланс — попробуйте ещё раз чуть позже или напишите в поддержку."
