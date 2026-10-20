@@ -32,21 +32,37 @@ PLANS = {
     "plan_3m": {"amount": 220, "label": "3 месяца", "days": 90},
 }
 
+DEVICE_OPTIONS = {
+    "1": {"device_limit": 1, "traffic_limit_gb": 50, "label": "1 устройство", "extra": "50 ГБ"},
+    "3": {"device_limit": 3, "traffic_limit_gb": 150, "label": "3 устройства", "extra": "150 ГБ"},
+}
+
 # --- H1Cloud VPN API (выдача VPN-доступа) ---
 H1CLOUD_API_URL = os.environ["H1CLOUD_API_URL"].rstrip("/")  # например http://de13.h1cloud.net:25053
 H1CLOUD_API_KEY = os.environ["H1CLOUD_API_KEY"]
 
 
-async def h1cloud_create_client(telegram_user_id: int, days: int) -> dict:
+async def h1cloud_create_client(
+    telegram_user_id: int,
+    days: int,
+    device_limit: Optional[int] = None,
+    traffic_limit_gb: Optional[float] = None,
+) -> dict:
     """Создаёт нового клиента в H1Cloud VPN API и возвращает весь объект client
     (включая name, sub_url, left_days, traffic_used_gb и т.д.). Бросает исключение при ошибке."""
     name = f"ElkaVPN_{telegram_user_id}_{int(time.time())}"  # уникально даже при продлении
+
+    payload = {"name": name, "days": days}
+    if device_limit is not None:
+        payload["device_limit"] = device_limit
+    if traffic_limit_gb is not None:
+        payload["traffic_limit_gb"] = traffic_limit_gb
 
     async with httpx.AsyncClient(timeout=15) as http:
         resp = await http.post(
             f"{H1CLOUD_API_URL}/create",
             headers={"X-API-Key": H1CLOUD_API_KEY, "Content-Type": "application/json"},
-            json={"name": name, "days": days},
+            json=payload,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -1076,6 +1092,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data in PLANS:
         plan = PLANS[query.data]
+        plan_key = query.data
+        devices_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"📱 {opt['label']} — {opt['extra']}", callback_data=f"dev_{n}_{plan_key}"
+            )]
+            for n, opt in DEVICE_OPTIONS.items()
+        ] + [[InlineKeyboardButton("⬅️ Назад", callback_data="buy_subscription")]])
+        await query.edit_message_text(
+            f"Тариф: {plan['label']}\n\nНа сколько устройств нужна подписка?",
+            reply_markup=devices_keyboard,
+        )
+
+    elif query.data.startswith("dev_") and query.data.split("_", 2)[2] in PLANS:
+        _, dev_n, plan_key = query.data.split("_", 2)
+        plan = PLANS[plan_key]
+        device_opt = DEVICE_OPTIONS[dev_n]
         user_id = query.from_user.id
         current_balance = get_balance(user_id)
         discount = get_user_discount(user_id)
@@ -1098,19 +1130,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         confirm_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Подтвердить оплату", callback_data=f"confirm_{query.data}")],
+            [InlineKeyboardButton("✅ Подтвердить оплату", callback_data=f"confirm_dev_{dev_n}_{plan_key}")],
             [InlineKeyboardButton("❌ Отмена", callback_data="buy_subscription")],
         ])
         await query.edit_message_text(
             f"Тариф: {plan['label']} — {price} руб.{discount_note}\n"
+            f"Устройств: {device_opt['label']} ({device_opt['extra']})\n"
             f"Текущий баланс: {current_balance:.0f} руб.\n\n"
             f"Подтвердить списание с баланса?",
             reply_markup=confirm_keyboard,
         )
 
-    elif query.data.startswith("confirm_") and query.data[len("confirm_"):] in PLANS:
-        plan_key = query.data[len("confirm_"):]
+    elif query.data.startswith("confirm_dev_"):
+        _, _, dev_n, plan_key = query.data.split("_", 3)
         plan = PLANS[plan_key]
+        device_opt = DEVICE_OPTIONS[dev_n]
         user_id = query.from_user.id
         price = discounted_price(plan["amount"], get_user_discount(user_id))  # пересчитываем на сервере
 
@@ -1124,7 +1158,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            client = await h1cloud_create_client(user_id, plan["days"])
+            client = await h1cloud_create_client(
+                user_id,
+                plan["days"],
+                device_limit=device_opt["device_limit"],
+                traffic_limit_gb=device_opt["traffic_limit_gb"],
+            )
             save_vpn_client(user_id, client["name"])
             clear_user_discount(user_id)  # скидка одноразовая — гасим только после успешной выдачи ключа
             text = (
