@@ -1,0 +1,1482 @@
+import os
+import sqlite3
+import json
+import uuid
+import time
+import io
+import csv
+from datetime import datetime, timedelta
+from typing import Optional
+import httpx
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MessageOriginUser,
+    InputFile,
+    InputMediaPhoto,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+)
+
+Token = '8895563528:AAHE15EpHQz5BqwH2DQqOaSLIo8M4UW-nyw'
+
+# --- Админка ---
+# Свой числовой Telegram ID узнать можно у бота @userinfobot — пришли ему /start
+ADMIN_ID = 5001950468
+
+# --- Platega ---
+PLATEGA_MERCHANT_ID = 'cb4794d5-ce7b-428e-be27-132aff155852'
+PLATEGA_SECRET = 'HymuYo2x3CfjRkLQMb8FRyuPo6dVlnzLF8Lnwbpssr4P7nAvnSb0WziARtU6mC75j1a7MlfYQN3HBCndUxlwF0OhuEvDmteTAKFr'
+PLATEGA_BASE_URL = "https://app.platega.io"
+
+PLANS = {
+    "plan_1m": {"amount": 80, "label": "1 месяц", "days": 30},
+    "plan_3m": {"amount": 220, "label": "3 месяца", "days": 90},
+}
+
+DEVICE_OPTIONS = {
+    "1": {"device_limit": 1, "traffic_limit_gb": 50, "label": "1 устройство", "extra": "50 ГБ"},
+    "3": {"device_limit": 3, "traffic_limit_gb": 150, "label": "3 устройства", "extra": "150 ГБ"},
+}
+
+# --- H1Cloud VPN API (выдача VPN-доступа) ---
+H1CLOUD_API_URL = "https://s-25271.de13.h1clayd.click/api".rstrip("/")
+H1CLOUD_API_KEY = '562aa908e06846eab4c8ccb723cfda109b5359754f68413a92c9464a2269e3ab'
+
+
+async def h1cloud_create_client(
+    telegram_user_id: int,
+    days: int,
+    device_limit: Optional[int] = None,
+    traffic_limit_gb: Optional[float] = None,
+) -> dict:
+    """Создаёт нового клиента в H1Cloud VPN API и возвращает весь объект client
+    (включая name, sub_url, left_days, traffic_used_gb и т.д.). Бросает исключение при ошибке."""
+    name = f"ElkaVPN_{telegram_user_id}_{int(time.time())}"  # уникально даже при продлении
+
+    payload = {"name": name, "days": days}
+    if device_limit is not None:
+        payload["device_limit"] = device_limit
+    if traffic_limit_gb is not None:
+        payload["traffic_limit_gb"] = traffic_limit_gb
+
+    async with httpx.AsyncClient(timeout=15) as http:
+        resp = await http.post(
+            f"{H1CLOUD_API_URL}/create",
+            headers={"X-API-Key": H1CLOUD_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    if not data.get("ok"):
+        raise RuntimeError(data.get("error", "H1Cloud create failed"))
+
+    client = data.get("client")
+    if not client or not client.get("sub_url"):
+        raise RuntimeError("H1Cloud не вернул client/sub_url")
+    return client
+
+
+async def h1cloud_get_client_info(name: str) -> dict:
+    """Запрашивает у H1Cloud актуальные данные по уже существующему клиенту
+    (сколько дней и трафика осталось, статус и т.д.). Бросает исключение при ошибке."""
+    async with httpx.AsyncClient(timeout=15) as http:
+        resp = await http.get(
+            f"{H1CLOUD_API_URL}/info",
+            headers={"X-API-Key": H1CLOUD_API_KEY},
+            params={"name": name},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    if not data.get("ok"):
+        raise RuntimeError(data.get("error", "H1Cloud info failed"))
+
+    client = data.get("client")
+    if not client:
+        raise RuntimeError("H1Cloud не вернул client")
+    return client
+
+
+def save_vpn_client(user_id: int, name: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO vpn_clients (user_id, name) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET name = excluded.name, updated_at = CURRENT_TIMESTAMP",
+        (user_id, name),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_vpn_client_name(user_id: int) -> Optional[str]:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT name FROM vpn_clients WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+# --- Обязательная подписка на канал ---
+CHANNEL_USERNAME = "@realelkavpn"
+CHANNEL_URL = "https://t.me/realelkavpn"
+
+CHECK_INTERVAL = 10
+MAX_CHECKS = 90  # 90 * 10 сек = 15 минут
+
+# --- База данных ---
+DB_PATH = "/data/bot_data.db"
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS balances (user_id INTEGER PRIMARY KEY, total_paid REAL NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_seen TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS vpn_clients ("
+        "user_id INTEGER PRIMARY KEY, "  # у каждого пользователя один актуальный VPN-аккаунт
+        "name TEXT NOT NULL, "           # имя клиента в H1Cloud
+        "updated_at TEXT DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS promo_codes ("
+        "code TEXT PRIMARY KEY, "
+        "amount REAL NOT NULL, "
+        "uses_left INTEGER, "  # NULL = безлимит
+        "created_at TEXT DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    )
+    try:
+        # 'balance' — начисляет деньги на баланс, 'discount' — скидка в процентах на подписку
+        conn.execute("ALTER TABLE promo_codes ADD COLUMN kind TEXT NOT NULL DEFAULT 'balance'")
+    except sqlite3.OperationalError:
+        pass  # колонка уже существует
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS user_discounts ("
+        "user_id INTEGER PRIMARY KEY, "  # у пользователя одна активная скидка на следующую покупку
+        "code TEXT NOT NULL, "
+        "percent INTEGER NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS promo_redemptions ("
+        "code TEXT NOT NULL, "
+        "user_id INTEGER NOT NULL, "
+        "redeemed_at TEXT DEFAULT CURRENT_TIMESTAMP, "
+        "PRIMARY KEY (code, user_id)"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS referrals ("
+        "referred_id INTEGER PRIMARY KEY, "  # каждого приглашённого считаем только один раз
+        "referrer_id INTEGER NOT NULL, "
+        "created_at TEXT DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS payments_log ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "user_id INTEGER NOT NULL, "
+        "kind TEXT NOT NULL, "     # topup / subscription / promo / admin_adjust
+        "amount REAL NOT NULL, "   # сумма движения (может быть отрицательной — списание)
+        "note TEXT, "              # например "1 месяц, 1 устройство" или код промокода
+        "created_at TEXT DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    )
+    # Индексы — ускоряют самые частые запросы по мере роста базы
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_redemptions_user ON promo_redemptions(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_log_user ON payments_log(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_log_created ON payments_log(created_at)")
+    conn.commit()
+    conn.close()
+
+
+def log_payment(user_id: int, kind: str, amount: float, note: str = ""):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO payments_log (user_id, kind, amount, note) VALUES (?, ?, ?, ?)",
+        (user_id, kind, amount, note),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_payments(limit: int = 20) -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT user_id, kind, amount, note, created_at FROM payments_log "
+        "ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [
+        {"user_id": r[0], "kind": r[1], "amount": r[2], "note": r[3], "created_at": r[4]}
+        for r in rows
+    ]
+
+
+def get_all_users_export() -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT u.user_id, u.username, u.first_seen, "
+        "COALESCE(b.total_paid, 0), "
+        "(SELECT COUNT(*) FROM referrals r WHERE r.referrer_id = u.user_id) "
+        "FROM users u LEFT JOIN balances b ON b.user_id = u.user_id "
+        "ORDER BY u.first_seen ASC"
+    ).fetchall()
+    conn.close()
+    return [
+        {"user_id": r[0], "username": r[1], "first_seen": r[2], "balance": r[3], "referrals": r[4]}
+        for r in rows
+    ]
+
+
+def find_user_by_username(username: str) -> Optional[int]:
+    """Ищет пользователя по username (без @, без учёта регистра). Возвращает user_id или None."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT user_id FROM users WHERE username = ? COLLATE NOCASE", (username,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def register_user(user_id: int, username: Optional[str]):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO users (user_id, username) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET username = excluded.username",
+        (user_id, username),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_all_user_ids() -> list[int]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT user_id FROM users").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def record_referral(referred_id: int, referrer_id: int):
+    """Запоминает, что referred_id пришёл по ссылке referrer_id.
+    Каждый приглашённый засчитывается только один раз (даже если перейдёт по ссылке снова)."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR IGNORE INTO referrals (referred_id, referrer_id) VALUES (?, ?)",
+        (referred_id, referrer_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def count_referrals(referrer_id: int) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (referrer_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def get_stats() -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    paying_users = conn.execute("SELECT COUNT(*) FROM balances WHERE total_paid > 0").fetchone()[0]
+    total_referrals = conn.execute("SELECT COUNT(*) FROM referrals").fetchone()[0]
+    active_subs = conn.execute("SELECT COUNT(*) FROM vpn_clients").fetchone()[0]
+    conn.close()
+    return {
+        "total_users": total_users,
+        "paying_users": paying_users,
+        "total_referrals": total_referrals,
+        "active_subs": active_subs,
+    }
+
+
+def get_promo_codes_list(limit: int = 30) -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT code, amount, uses_left, kind FROM promo_codes ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [{"code": r[0], "amount": r[1], "uses_left": r[2], "kind": r[3]} for r in rows]
+
+
+def count_promo_codes() -> int:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT COUNT(*) FROM promo_codes").fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def add_to_balance(user_id: int, amount: float):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO balances (user_id, total_paid) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET total_paid = total_paid + excluded.total_paid",
+        (user_id, amount),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_balance(user_id: int) -> float:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT total_paid FROM balances WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    return row[0] if row else 0.0
+
+
+def subtract_balance(user_id: int, amount: float) -> bool:
+    """Списывает сумму с баланса, если денег достаточно. Возвращает True при успехе."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(
+        "UPDATE balances SET total_paid = total_paid - ? WHERE user_id = ? AND total_paid >= ?",
+        (amount, user_id, amount),
+    )
+    success = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return success
+
+
+def admin_adjust_balance(user_id: int, amount: float) -> float:
+    """Принудительно изменяет баланс на сумму amount (может быть отрицательной) —
+    без проверки достаточности средств. Используется админом для ручных корректировок
+    (например, после оформления возврата в Platega). Возвращает новый баланс."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO balances (user_id, total_paid) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET total_paid = total_paid + excluded.total_paid",
+        (user_id, amount),
+    )
+    conn.commit()
+    new_balance = conn.execute(
+        "SELECT total_paid FROM balances WHERE user_id = ?", (user_id,)
+    ).fetchone()[0]
+    conn.close()
+    return new_balance
+
+
+def create_promo_code(code: str, amount: float, uses_left: Optional[int], kind: str = "balance"):
+    """kind='balance': amount — сумма в рублях; kind='discount': amount — процент скидки."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO promo_codes (code, amount, uses_left, kind) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(code) DO UPDATE SET amount = excluded.amount, "
+        "uses_left = excluded.uses_left, kind = excluded.kind",
+        (code, amount, uses_left, kind),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_user_discount(user_id: int, code: str, percent: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO user_discounts (user_id, code, percent) VALUES (?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET code = excluded.code, percent = excluded.percent",
+        (user_id, code, percent),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_discount(user_id: int) -> int:
+    """Возвращает процент активной скидки пользователя (0, если скидки нет)."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT percent FROM user_discounts WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def clear_user_discount(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM user_discounts WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def discounted_price(amount: float, percent: int) -> int:
+    """Цена с учётом скидки, округлённая до целых рублей (минимум 1 руб.)."""
+    if percent <= 0:
+        return int(amount)
+    return max(1, round(amount * (100 - percent) / 100))
+
+
+def redeem_promo_code(code: str, user_id: int) -> tuple[bool, str]:
+    """Возвращает (успех, сообщение для пользователя)."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT amount, uses_left, kind FROM promo_codes WHERE code = ?", (code,)
+    ).fetchone()
+
+    if row is None:
+        conn.close()
+        return False, "Такого промокода не существует."
+
+    amount, uses_left, kind = row
+
+    already = conn.execute(
+        "SELECT 1 FROM promo_redemptions WHERE code = ? AND user_id = ?", (code, user_id)
+    ).fetchone()
+    if already:
+        conn.close()
+        return False, "Ты уже активировал(а) этот промокод раньше."
+
+    if uses_left is not None and uses_left <= 0:
+        conn.close()
+        return False, "У этого промокода закончились активации."
+
+    if uses_left is not None:
+        conn.execute("UPDATE promo_codes SET uses_left = uses_left - 1 WHERE code = ?", (code,))
+
+    conn.execute(
+        "INSERT INTO promo_redemptions (code, user_id) VALUES (?, ?)", (code, user_id)
+    )
+    conn.execute(
+        "INSERT INTO balances (user_id, total_paid) VALUES (?, 0) ON CONFLICT(user_id) DO NOTHING",
+        (user_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    if kind == "discount":
+        percent = int(amount)
+        set_user_discount(user_id, code, percent)
+        return True, (
+            f"Промокод активирован! Скидка {percent}% будет применена "
+            f"к вашей следующей покупке подписки."
+        )
+
+    add_to_balance(user_id, amount)
+    log_payment(user_id, "promo", amount, f"код {code}")
+    return True, f"Промокод активирован! Начислено {amount:.0f} руб."
+
+
+# ---------- Тексты и клавиатуры меню ----------
+
+# Картинки лежат в папке images/ рядом с этим файлом — на каждый раздел своя.
+IMAGES = {
+    "main": "images/main.png",
+    "buy": "images/buy.png",
+    "subscription": "images/subscription.png",
+    "balance": "images/balance.png",
+    "promo": "images/promo.png",
+    "invite": "images/invite.png",
+    "docs": "images/docs.png",
+}
+
+
+async def show_photo_screen(query, image_key: str, caption: str, reply_markup=None, parse_mode="Markdown"):
+    """Меняет текущее сообщение (фото+подпись) на нужный раздел. Используется при
+    переходах по кнопкам — то же самое, что раньше делал query.edit_message_text."""
+    media = InputMediaPhoto(open(IMAGES[image_key], "rb"), caption=caption, parse_mode=parse_mode)
+    try:
+        await query.edit_message_media(media=media, reply_markup=reply_markup)
+    except Exception:
+        # На случай если у текущего сообщения почему-то нет фото — просто шлём новое
+        await query.message.reply_photo(
+            photo=open(IMAGES[image_key], "rb"),
+            caption=caption,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+
+
+async def send_photo_screen(message, image_key: str, caption: str, reply_markup=None, parse_mode="Markdown"):
+    """Отправляет НОВОЕ фото-сообщение — для /start и для ответов на обычный текст
+    пользователя (там нет кнопки, которую можно отредактировать). Возвращает отправленное
+    сообщение (пригодится, если потом нужно отредактировать именно его)."""
+    return await message.reply_photo(
+        photo=open(IMAGES[image_key], "rb"),
+        caption=caption,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
+
+
+def main_menu():
+    text = (
+        "🌲 *ELKA VPN*\n\n"
+        "🌎 От 1 Сервера\n"
+        "🛡️ Без логов подключений\n"
+        "🔒 Надёжное подключение\n"
+        "🚀 Высокая скорость соединения"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Купить подписку", callback_data="buy_subscription")],
+        [InlineKeyboardButton("📊 Моя подписка", callback_data="my_subscription")],
+        [
+            InlineKeyboardButton("💰 Баланс", callback_data="balance"),
+            InlineKeyboardButton("🎁 Промокод", callback_data="promo"),
+        ],
+        [InlineKeyboardButton("👥 Пригласить друзей", callback_data="invite")],
+        [InlineKeyboardButton("🆘 Поддержка", url="https://t.me/blelbu")],
+        [InlineKeyboardButton("📄 Документы", callback_data="docs")],
+    ])
+    return text, keyboard
+
+
+def plans_menu(discount_percent: int = 0):
+    text = "Выберите срок подписки:"
+    if discount_percent > 0:
+        text += f"\n\n🏷 Ваша скидка {discount_percent}% применена к ценам ниже."
+
+    rows = []
+    for key, plan in PLANS.items():
+        price = discounted_price(plan["amount"], discount_percent)
+        suffix = f" (−{discount_percent}%)" if discount_percent > 0 else ""
+        rows.append([InlineKeyboardButton(f"{plan['label']} — {price} руб{suffix}", callback_data=key)])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def back_only_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]])
+
+
+def balance_menu(total: float):
+    text = f"💰 Баланс: {total:.0f} руб."
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Пополнить", callback_data="topup")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
+    ])
+    return text, keyboard
+
+
+def admin_menu():
+    text = "🛠 *Админ-панель*"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton("🔍 Найти пользователя", callback_data="admin_find")],
+        [InlineKeyboardButton("📢 Рассылка всем", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🎁 Создать промокод (деньги)", callback_data="admin_create_promo")],
+        [InlineKeyboardButton("🏷 Создать промокод (скидка %)", callback_data="admin_create_discount")],
+        [InlineKeyboardButton("💸 Корректировка баланса", callback_data="admin_adjust")],
+        [InlineKeyboardButton("🎟 Список промокодов", callback_data="admin_promo_list")],
+        [InlineKeyboardButton("📜 Последние операции", callback_data="admin_payments_log")],
+        [InlineKeyboardButton("📤 Экспорт пользователей", callback_data="admin_export_users")],
+    ])
+    return text, keyboard
+
+
+def admin_back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_back")]])
+
+
+def docs_menu():
+    text = "📄 *Документы ELKA VPN*\n\nНиже — все документы сервиса:"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛡 Политика конфиденциальности", url="https://telegra.ph/Politika-konfidencialnosti-09-21-83")],
+        [InlineKeyboardButton("📋 Условия использования", url="https://telegra.ph/Polzovatelskoe-soglashenie-09-21-65")],
+        [InlineKeyboardButton("💵 Условия возврата", url="https://telegra.ph/Usloviya-vozvrata-10-03")],
+        [InlineKeyboardButton("🔒 Политика бота", callback_data="bot_policy")],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")],
+    ])
+    return text, keyboard
+
+
+BOT_POLICY_TEXT = (
+    "🔒 Политика конфиденциальности бота Elka VPN\n\n"
+    "1. Мы храним только данные, необходимые для работы сервиса: ваш Telegram ID, username, баланс и историю покупок подписок.\n\n"
+    "2. Мы не ведём логи посещённых сайтов и не анализируем содержимое VPN-трафика.\n\n"
+    "3. Данные об оплате обрабатываются платёжным партнёром Platega согласно его правилам.\n\n"
+    "4. Данные не передаются третьим лицам, кроме случаев, предусмотренных законом.\n\n"
+    "5. Вы можете запросить удаление своих данных, обратившись в поддержку https://t.me/blelbu"
+)
+
+
+def docs_back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="docs")]])
+
+
+def subscribe_gate_menu():
+    text = (
+        "Чтобы пользоваться ботом, подпишитесь на наш канал, "
+        "а затем нажмите «Проверить подписку»."
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Канал", url=CHANNEL_URL)],
+        [InlineKeyboardButton("✅ Проверить подписку", callback_data="check_subscription")],
+    ])
+    return text, keyboard
+
+
+async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        return False
+
+
+# ---------- Platega ----------
+
+async def create_payment(amount: float, description: str) -> dict:
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{PLATEGA_BASE_URL}/transaction/process",
+            headers={
+                "X-MerchantId": PLATEGA_MERCHANT_ID,
+                "X-Secret": PLATEGA_SECRET,
+                "Content-Type": "application/json",
+            },
+            json={
+                "paymentMethod": 2,  # СБП — сверь код метода в доках/у менеджера Platega
+                "paymentDetails": {"amount": amount, "currency": "RUB"},
+                "description": description,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def check_payment_status(transaction_id: str) -> str:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{PLATEGA_BASE_URL}/transaction/{transaction_id}",
+            headers={
+                "X-MerchantId": PLATEGA_MERCHANT_ID,
+                "X-Secret": PLATEGA_SECRET,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return str(data.get("status", "")).upper()
+
+
+async def check_payment_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    data = job.data
+    data["attempts"] = data.get("attempts", 0) + 1
+
+    try:
+        status = await check_payment_status(data["transaction_id"])
+    except Exception:
+        status = ""
+
+    print(f"[Platega] transaction={data['transaction_id']} status={status}")
+
+    if status in ("CONFIRMED", "PAID", "SUCCESS", "SUCCEEDED"):
+        add_to_balance(data["user_id"], data["amount"])
+        log_payment(data["user_id"], "topup", data["amount"], "оплата через Platega")
+        try:
+            await context.bot.edit_message_media(
+                chat_id=data["chat_id"],
+                message_id=data["message_id"],
+                media=InputMediaPhoto(open(IMAGES["balance"], "rb"), caption="✅ Оплата получена!"),
+                reply_markup=back_only_keyboard(),
+            )
+        except Exception:
+            await context.bot.send_photo(
+                chat_id=data["chat_id"],
+                photo=open(IMAGES["balance"], "rb"),
+                caption="✅ Оплата получена!",
+                reply_markup=back_only_keyboard(),
+            )
+        job.schedule_removal()
+    elif status in ("EXPIRED", "FAILED", "CANCELLED", "CANCELED", "DECLINED"):
+        try:
+            await context.bot.edit_message_media(
+                chat_id=data["chat_id"],
+                message_id=data["message_id"],
+                media=InputMediaPhoto(
+                    open(IMAGES["balance"], "rb"),
+                    caption="❌ Платёж не прошёл или истёк. Попробуй оформить оплату заново через меню.",
+                ),
+                reply_markup=back_only_keyboard(),
+            )
+        except Exception:
+            pass
+        job.schedule_removal()
+    elif data["attempts"] >= MAX_CHECKS:
+        try:
+            await context.bot.edit_message_media(
+                chat_id=data["chat_id"],
+                message_id=data["message_id"],
+                media=InputMediaPhoto(
+                    open(IMAGES["balance"], "rb"),
+                    caption="⌛ Время ожидания оплаты истекло. Если уже оплатил(а) — напиши в поддержку.",
+                ),
+                reply_markup=back_only_keyboard(),
+            )
+        except Exception:
+            pass
+        job.schedule_removal()
+
+
+# ---------- Хендлеры ----------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id, update.effective_user.username)
+
+    # Если пользователь пришёл по реферальной ссылке — запоминаем, кто его пригласил
+    if context.args:
+        payload = context.args[0]
+        if payload.startswith("ref_"):
+            try:
+                referrer_id = int(payload[len("ref_"):])
+                if referrer_id != update.effective_user.id:  # нельзя пригласить самого себя
+                    record_referral(update.effective_user.id, referrer_id)
+            except ValueError:
+                pass
+
+    if not await is_subscribed(context, update.effective_user.id):
+        text, keyboard = subscribe_gate_menu()
+        await send_photo_screen(update.message, "main", text, reply_markup=keyboard)
+        return
+
+    text, keyboard = main_menu()
+    await send_photo_screen(update.message, "main", text, reply_markup=keyboard)
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return  # обычные пользователи не получают вообще никакого ответа на /admin
+    context.user_data["admin_awaiting"] = None  # та же защита, что и в admin_button_handler
+    text, keyboard = admin_menu()
+    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+
+async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатия внутри админ-панели. Возвращает True, если кнопка обработана здесь."""
+    query = update.callback_query
+
+    if query.from_user.id != ADMIN_ID:
+        return False
+
+    # Любое нажатие в админке сбрасывает незавершённый сценарий ввода текста —
+    # иначе случайное сообщение могло попасть в старый, уже брошенный диалог.
+    context.user_data["admin_awaiting"] = None
+
+    if query.data == "admin_back":
+        text, keyboard = admin_menu()
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        return True
+
+    if query.data == "admin_stats":
+        stats = get_stats()
+        await query.edit_message_text(
+            "📊 *Статистика*\n\n"
+            f"👥 Всего пользователей: {stats['total_users']}\n"
+            f"💳 Оплативших хотя бы раз: {stats['paying_users']}\n"
+            f"🔌 Активных VPN-аккаунтов: {stats['active_subs']}\n"
+            f"👥 Всего рефералов: {stats['total_referrals']}",
+            reply_markup=admin_back_keyboard(),
+            parse_mode="Markdown",
+        )
+        return True
+
+    if query.data == "admin_find":
+        context.user_data["admin_awaiting"] = "find"
+        await query.edit_message_text(
+            "Пришли ID, @username или перешли сюда сообщение от пользователя, чтобы посмотреть его баланс.",
+            reply_markup=admin_back_keyboard(),
+        )
+        return True
+
+    if query.data == "admin_broadcast":
+        context.user_data["admin_awaiting"] = "broadcast"
+        await query.edit_message_text(
+            "Пришли текст сообщения — он будет отправлен всем пользователям бота.",
+            reply_markup=admin_back_keyboard(),
+        )
+        return True
+
+    if query.data == "admin_create_discount":
+        context.user_data["admin_awaiting"] = "create_discount"
+        await query.edit_message_text(
+            "Пришли промокод на скидку в формате:\n\n"
+            "`КОД ПРОЦЕНТ КОЛИЧЕСТВО`\n\n"
+            "Например: `SALE20 20 50` — скидка 20% на следующую покупку подписки, "
+            "можно активировать 50 раз всего.\n"
+            "Если количество не указать — промокод будет безлимитным.\n"
+            "Например просто: `SALE20 20`\n\n"
+            "Процент — целое число от 1 до 99.",
+            reply_markup=admin_back_keyboard(),
+            parse_mode="Markdown",
+        )
+        return True
+
+    if query.data == "admin_create_promo":
+        context.user_data["admin_awaiting"] = "create_promo"
+        await query.edit_message_text(
+            "Пришли промокод в формате:\n\n"
+            "`КОД СУММА КОЛИЧЕСТВО`\n\n"
+            "Например: `SALE50 100 10` — код SALE50, начисляет 100 руб., можно активировать 10 раз всего.\n"
+            "Если количество не указать — промокод будет безлимитным.\n"
+            "Например просто: `SALE50 100`",
+            reply_markup=admin_back_keyboard(),
+            parse_mode="Markdown",
+        )
+        return True
+
+    if query.data.startswith("adj_plus_") or query.data.startswith("adj_minus_"):
+        sign = 1 if query.data.startswith("adj_plus_") else -1
+        target_id = int(query.data.split("_")[-1])
+        context.user_data["admin_awaiting"] = "adjust_amount"
+        context.user_data["adjust_target_id"] = target_id
+        context.user_data["adjust_sign"] = sign
+        action = "начислить" if sign == 1 else "списать"
+        await query.edit_message_text(
+            f"Сколько руб. {action} пользователю {target_id}? Пришли число.",
+            reply_markup=admin_back_keyboard(),
+        )
+        return True
+
+    if query.data == "admin_promo_list":
+        codes = get_promo_codes_list()
+        total = count_promo_codes()
+        if not codes:
+            await query.edit_message_text("Промокодов пока нет.", reply_markup=admin_back_keyboard())
+            return True
+
+        lines = []
+        for c in codes:
+            if c["kind"] == "discount":
+                value_text = f"скидка {int(c['amount'])}%"
+            else:
+                value_text = f"{c['amount']:.0f} руб."
+            uses_text = "безлимит" if c["uses_left"] is None else f"осталось {c['uses_left']}"
+            lines.append(f"`{c['code']}` — {value_text}, {uses_text}")
+
+        shown_note = f" (последние {len(codes)} из {total})" if total > len(codes) else ""
+        text = f"🎟 *Промокоды*{shown_note}:\n\n" + "\n".join(lines)
+        await query.edit_message_text(text, reply_markup=admin_back_keyboard(), parse_mode="Markdown")
+        return True
+
+    if query.data == "admin_payments_log":
+        payments = get_recent_payments(20)
+        if not payments:
+            await query.edit_message_text("Операций пока не было.", reply_markup=admin_back_keyboard())
+            return True
+
+        kind_labels = {
+            "topup": "Пополнение",
+            "subscription": "Покупка подписки",
+            "promo": "Промокод",
+            "admin_adjust": "Корректировка админом",
+            "refund": "Возврат",
+        }
+        lines = []
+        for p in payments:
+            sign = "+" if p["amount"] >= 0 else ""
+            label = kind_labels.get(p["kind"], p["kind"])
+            note = f" ({p['note']})" if p["note"] else ""
+            lines.append(f"{p['created_at']} — {p['user_id']}: {sign}{p['amount']:.0f} руб. [{label}]{note}")
+
+        text = "📜 *Последние операции*:\n\n" + "\n".join(lines)
+        await query.edit_message_text(text, reply_markup=admin_back_keyboard(), parse_mode="Markdown")
+        return True
+
+    if query.data == "admin_export_users":
+        users = get_all_users_export()
+        if not users:
+            await query.edit_message_text("Пользователей пока нет.", reply_markup=admin_back_keyboard())
+            return True
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["user_id", "username", "first_seen", "balance", "referrals"])
+        for u in users:
+            writer.writerow([u["user_id"], u["username"] or "", u["first_seen"], u["balance"], u["referrals"]])
+
+        file_bytes = buf.getvalue().encode("utf-8-sig")  # BOM — чтобы Excel сразу показал кириллицу
+        await context.bot.send_document(
+            chat_id=query.message.chat_id,
+            document=InputFile(io.BytesIO(file_bytes), filename="users_export.csv"),
+            caption=f"Экспорт пользователей: {len(users)} чел.",
+        )
+        await query.edit_message_text("Файл с пользователями отправлен выше ⬆️", reply_markup=admin_back_keyboard())
+        return True
+
+    if query.data == "admin_adjust":
+        context.user_data["admin_awaiting"] = "adjust"
+        await query.edit_message_text(
+            "Пришли в формате:\n\n"
+            "`ID СУММА`\n\n"
+            "Например: `123456789 -100` — спишет 100 руб. с баланса (используй при возврате в Platega).\n"
+            "Со знаком `+` или без знака — наоборот, начислит. Например: `123456789 50`",
+            reply_markup=admin_back_keyboard(),
+            parse_mode="Markdown",
+        )
+        return True
+
+    return False
+
+
+async def notify_user_balance_change(context: ContextTypes.DEFAULT_TYPE, user_id: int, delta: float, new_balance: float):
+    """Шлёт пользователю сообщение о том, что админ изменил его баланс.
+    Если не получилось (например, пользователь ни разу не писал боту) — тихо игнорируем."""
+    if delta >= 0:
+        text = (
+            f"💰 Вам начислено {delta:.0f} руб.\n"
+            f"Текущий баланс: {new_balance:.0f} руб."
+        )
+    else:
+        text = (
+            f"⚠️ С вашего баланса списано {abs(delta):.0f} руб.\n"
+            f"Текущий баланс: {new_balance:.0f} руб."
+        )
+    try:
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=back_only_keyboard())
+    except Exception:
+        pass
+
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Единый обработчик обычных текстовых сообщений: ловит промокоды и суммы пополнения
+    от любых пользователей, и ответы админа в режиме поиска/рассылки/создания промокода."""
+
+    # --- Пользователь вводит сумму пополнения баланса ---
+    if context.user_data.get("awaiting_topup"):
+        context.user_data["awaiting_topup"] = False
+
+        raw = update.message.text.strip().replace(",", ".")
+        try:
+            amount = float(raw)
+        except ValueError:
+            await send_photo_screen(
+                update.message, "balance",
+                "Это не похоже на число. Открой раздел «Баланс» ещё раз и попробуй снова.",
+                reply_markup=back_only_keyboard(),
+            )
+            return
+
+        if amount <= 0:
+            await send_photo_screen(
+                update.message, "balance",
+                "Сумма должна быть больше нуля. Открой раздел «Баланс» ещё раз и попробуй снова.",
+                reply_markup=back_only_keyboard(),
+            )
+            return
+
+        try:
+            payment = await create_payment(amount=amount, description="Пополнение баланса ELKA VPN")
+        except Exception:
+            await send_photo_screen(
+                update.message, "balance",
+                "Не получилось создать платёж. Попробуй ещё раз чуть позже.",
+                reply_markup=back_only_keyboard(),
+            )
+            return
+
+        pay_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Оплатить", url=payment["redirect"])],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
+        ])
+        sent = await send_photo_screen(
+            update.message, "balance",
+            f"Пополнение: {amount:.0f} руб.\n"
+            f"Нажми кнопку ниже, чтобы перейти к оплате. После оплаты бот сам зачислит сумму на баланс.",
+            reply_markup=pay_keyboard,
+        )
+
+        context.job_queue.run_repeating(
+            check_payment_job,
+            interval=CHECK_INTERVAL,
+            first=CHECK_INTERVAL,
+            data={
+                "transaction_id": payment["transactionId"],
+                "chat_id": update.effective_chat.id,
+                "message_id": sent.message_id,
+                "user_id": update.effective_user.id,
+                "amount": amount,
+                "plan_label": "Пополнение баланса",
+                "attempts": 0,
+            },
+            name=f"check_{payment['transactionId']}",
+        )
+        return
+
+    # --- Пользователь вводит промокод ---
+    if context.user_data.get("awaiting_promo"):
+        context.user_data["awaiting_promo"] = False
+        code = update.message.text.strip().upper()
+        success, message = redeem_promo_code(code, update.effective_user.id)
+        await send_photo_screen(update.message, "promo", message, reply_markup=back_only_keyboard())
+        return
+
+    # --- Дальше — только для админа ---
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    awaiting = context.user_data.get("admin_awaiting")
+    if not awaiting:
+        return  # админ просто пишет боту не в контексте админки — игнорируем
+
+    context.user_data["admin_awaiting"] = None
+
+    if awaiting == "find":
+        raw = update.message.text.strip() if update.message.text else ""
+
+        # 1) Переслали сообщение от пользователя — берём ID прямо оттуда
+        if isinstance(update.message.forward_origin, MessageOriginUser):
+            target_id = update.message.forward_origin.sender_user.id
+        # 2) Прислали @username или username без собачки
+        elif raw.lstrip("@") and not raw.lstrip("@").lstrip("-").isdigit():
+            target_id = find_user_by_username(raw.lstrip("@"))
+            if target_id is None:
+                await update.message.reply_text(
+                    "Не нашёл пользователя с таким username — он должен хотя бы раз "
+                    "написать боту /start. Попробуй ID или пересылку сообщения.",
+                    reply_markup=admin_back_keyboard(),
+                )
+                return
+        # 3) Прислали числовой ID
+        else:
+            try:
+                target_id = int(raw)
+            except ValueError:
+                await update.message.reply_text(
+                    "Не похоже ни на ID, ни на username. Пришли ID цифрами, @username "
+                    "или перешли сюда любое сообщение от нужного пользователя.",
+                    reply_markup=admin_back_keyboard(),
+                )
+                return
+
+        total = get_balance(target_id)
+        referrals = count_referrals(target_id)
+        discount = get_user_discount(target_id)
+        discount_line = f"\nАктивная скидка: {discount}%" if discount > 0 else ""
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("➕ Начислить", callback_data=f"adj_plus_{target_id}"),
+                InlineKeyboardButton("➖ Списать", callback_data=f"adj_minus_{target_id}"),
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="admin_back")],
+        ])
+        await update.message.reply_text(
+            f"Пользователь {target_id}\n"
+            f"Баланс: {total:.0f} руб.\n"
+            f"Приглашено друзей: {referrals}"
+            f"{discount_line}",
+            reply_markup=keyboard,
+        )
+
+    elif awaiting == "broadcast":
+        text = update.message.text
+        user_ids = get_all_user_ids()
+        sent, failed = 0, 0
+        for uid in user_ids:
+            try:
+                await context.bot.send_message(chat_id=uid, text=text)
+                sent += 1
+            except Exception:
+                failed += 1
+        await update.message.reply_text(
+            f"Рассылка завершена. Доставлено: {sent}, не удалось: {failed}.",
+            reply_markup=admin_back_keyboard(),
+        )
+
+    elif awaiting == "create_promo":
+        parts = update.message.text.strip().split()
+        if len(parts) not in (2, 3):
+            await update.message.reply_text(
+                "Неверный формат. Нужно: КОД СУММА [КОЛИЧЕСТВО]. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        code = parts[0].upper()
+        try:
+            amount = float(parts[1])
+        except ValueError:
+            await update.message.reply_text(
+                "Сумма должна быть числом. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        if amount <= 0:
+            await update.message.reply_text(
+                "Сумма промокода должна быть больше нуля.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        uses_left = None
+        if len(parts) == 3:
+            try:
+                uses_left = int(parts[2])
+            except ValueError:
+                await update.message.reply_text(
+                    "Количество активаций должно быть целым числом.",
+                    reply_markup=admin_back_keyboard(),
+                )
+                return
+            if uses_left < 1:
+                await update.message.reply_text(
+                    "Количество активаций должно быть не меньше 1 (или не указывай его совсем для безлимита).",
+                    reply_markup=admin_back_keyboard(),
+                )
+                return
+
+        create_promo_code(code, amount, uses_left)
+        uses_text = "безлимитный" if uses_left is None else f"{uses_left} активаций"
+        await update.message.reply_text(
+            f"✅ Промокод «{code}» создан: {amount:.0f} руб., {uses_text}.",
+            reply_markup=admin_back_keyboard(),
+        )
+
+    elif awaiting == "create_discount":
+        parts = update.message.text.strip().split()
+        if len(parts) not in (2, 3):
+            await update.message.reply_text(
+                "Неверный формат. Нужно: КОД ПРОЦЕНТ [КОЛИЧЕСТВО]. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        code = parts[0].upper()
+        try:
+            percent = int(parts[1])
+        except ValueError:
+            await update.message.reply_text(
+                "Процент должен быть целым числом. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        if not 1 <= percent <= 99:
+            await update.message.reply_text(
+                "Процент должен быть от 1 до 99. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        uses_left = None
+        if len(parts) == 3:
+            try:
+                uses_left = int(parts[2])
+            except ValueError:
+                await update.message.reply_text(
+                    "Количество активаций должно быть целым числом.",
+                    reply_markup=admin_back_keyboard(),
+                )
+                return
+            if uses_left < 1:
+                await update.message.reply_text(
+                    "Количество активаций должно быть не меньше 1 (или не указывай его совсем для безлимита).",
+                    reply_markup=admin_back_keyboard(),
+                )
+                return
+
+        create_promo_code(code, percent, uses_left, kind="discount")
+        uses_text = "безлимитный" if uses_left is None else f"{uses_left} активаций"
+        await update.message.reply_text(
+            f"✅ Промокод на скидку «{code}» создан: {percent}%, {uses_text}.",
+            reply_markup=admin_back_keyboard(),
+        )
+
+    elif awaiting == "adjust":
+        parts = update.message.text.strip().split()
+        if len(parts) != 2:
+            await update.message.reply_text(
+                "Неверный формат. Нужно: ID СУММА. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        try:
+            target_id = int(parts[0])
+            delta = float(parts[1])
+        except ValueError:
+            await update.message.reply_text(
+                "ID должен быть целым числом, сумма — числом (можно со знаком -). Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        if delta == 0:
+            await update.message.reply_text(
+                "Сумма не может быть нулевой. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        new_balance = admin_adjust_balance(target_id, delta)
+        log_payment(target_id, "admin_adjust", delta, "корректировка через /admin")
+        action = "списано" if delta < 0 else "начислено"
+        await update.message.reply_text(
+            f"Готово. У пользователя {target_id} {action} {abs(delta):.0f} руб.\n"
+            f"Текущий баланс: {new_balance:.0f} руб.",
+            reply_markup=admin_back_keyboard(),
+        )
+        await notify_user_balance_change(context, target_id, delta, new_balance)
+
+    elif awaiting == "adjust_amount":
+        target_id = context.user_data.get("adjust_target_id")
+        sign = context.user_data.get("adjust_sign", 1)
+
+        try:
+            value = float(update.message.text.strip().replace(",", "."))
+        except ValueError:
+            await update.message.reply_text(
+                "Это не похоже на число. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        if value == 0:
+            await update.message.reply_text(
+                "Сумма не может быть нулевой. Попробуй ещё раз через /admin.",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+        delta = abs(value) * sign
+        new_balance = admin_adjust_balance(target_id, delta)
+        log_payment(target_id, "admin_adjust", delta, "корректировка через /admin")
+        action = "начислено" if sign == 1 else "списано"
+        await update.message.reply_text(
+            f"Готово. Пользователю {target_id} {action} {abs(value):.0f} руб.\n"
+            f"Текущий баланс: {new_balance:.0f} руб.",
+            reply_markup=admin_back_keyboard(),
+        )
+        await notify_user_balance_change(context, target_id, delta, new_balance)
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["awaiting_promo"] = False
+    context.user_data["awaiting_topup"] = False
+
+    if query.data.startswith("admin_") or query.data.startswith("adj_"):
+        handled = await admin_button_handler(update, context)
+        if handled:
+            return
+
+    if query.data == "check_subscription":
+        if await is_subscribed(context, query.from_user.id):
+            text, keyboard = main_menu()
+            await show_photo_screen(query, "main", text, reply_markup=keyboard)
+        # если подписки нет — ничего не делаем, query.answer() уже вызван выше
+        return
+
+    if query.data == "buy_subscription":
+        text, keyboard = plans_menu(get_user_discount(query.from_user.id))
+        await show_photo_screen(query, "buy", text, reply_markup=keyboard)
+
+    elif query.data in PLANS:
+        plan = PLANS[query.data]
+        plan_key = query.data
+        devices_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"📱 {opt['label']} — {opt['extra']}", callback_data=f"dev_{n}_{plan_key}"
+            )]
+            for n, opt in DEVICE_OPTIONS.items()
+        ] + [[InlineKeyboardButton("⬅️ Назад", callback_data="buy_subscription")]])
+        await show_photo_screen(
+            query, "buy",
+            f"Тариф: {plan['label']}\n\nНа сколько устройств нужна подписка?",
+            reply_markup=devices_keyboard,
+        )
+
+    elif query.data.startswith("dev_") and query.data.split("_", 2)[2] in PLANS:
+        _, dev_n, plan_key = query.data.split("_", 2)
+        plan = PLANS[plan_key]
+        device_opt = DEVICE_OPTIONS[dev_n]
+        user_id = query.from_user.id
+        current_balance = get_balance(user_id)
+        discount = get_user_discount(user_id)
+        price = discounted_price(plan["amount"], discount)
+        discount_note = f" (скидка {discount}%, вместо {plan['amount']:.0f} руб.)" if discount > 0 else ""
+
+        if current_balance < price:
+            missing = price - current_balance
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Пополнить баланс", callback_data="topup")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
+            ])
+            await show_photo_screen(
+                query, "buy",
+                f"Недостаточно средств на балансе.\n\n"
+                f"Тариф «{plan['label']}» стоит {price} руб.{discount_note}\n"
+                f"На балансе: {current_balance:.0f} руб.\n"
+                f"Не хватает: {missing:.0f} руб.",
+                reply_markup=keyboard,
+            )
+            return
+
+        confirm_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Подтвердить оплату", callback_data=f"confirm_dev_{dev_n}_{plan_key}")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="buy_subscription")],
+        ])
+        await show_photo_screen(
+            query, "buy",
+            f"Тариф: {plan['label']} — {price} руб.{discount_note}\n"
+            f"Устройств: {device_opt['label']} ({device_opt['extra']})\n"
+            f"Текущий баланс: {current_balance:.0f} руб.\n\n"
+            f"Подтвердить списание с баланса?",
+            reply_markup=confirm_keyboard,
+        )
+
+    elif query.data.startswith("confirm_dev_"):
+        _, _, dev_n, plan_key = query.data.split("_", 3)
+        plan = PLANS[plan_key]
+        device_opt = DEVICE_OPTIONS[dev_n]
+        user_id = query.from_user.id
+        price = discounted_price(plan["amount"], get_user_discount(user_id))  # пересчитываем на сервере
+
+        success = subtract_balance(user_id, price)
+        if not success:
+            # Баланс мог измениться между подтверждением и списанием (например, уже потратил в другом месте)
+            await show_photo_screen(
+                query, "buy",
+                "Не получилось списать средства — возможно, баланс изменился. Попробуй ещё раз.",
+                reply_markup=back_only_keyboard(),
+            )
+            return
+
+        try:
+            client = await h1cloud_create_client(
+                user_id,
+                plan["days"],
+                device_limit=device_opt["device_limit"],
+                traffic_limit_gb=device_opt["traffic_limit_gb"],
+            )
+            save_vpn_client(user_id, client["name"])
+            clear_user_discount(user_id)  # скидка одноразовая — гасим только после успешной выдачи ключа
+            log_payment(
+                user_id, "subscription", -price,
+                f"{plan['label']}, {device_opt['label']}",
+            )
+            text = (
+                "✅ Оплата прошла!\n\n"
+                "Ваша персональная ссылка-подписка:\n"
+                f"{client['sub_url']}\n\n"
+                "Добавьте эту ссылку в приложение (v2rayNG, NekoBox, Happ, Streisand и т.п.) — "
+                "там появятся все доступные сервера."
+            )
+        except Exception:
+            # Деньги уже списаны — возвращаем их, раз ключ выдать не получилось
+            admin_adjust_balance(user_id, price)
+            log_payment(user_id, "refund", price, "возврат: не удалось выдать VPN-ключ")
+            text = (
+                "Оплата прошла, но не получилось автоматически выдать ключ. "
+                "Деньги возвращены на баланс — попробуйте ещё раз чуть позже или напишите в поддержку."
+            )
+
+        await show_photo_screen(query, "buy", text, reply_markup=back_only_keyboard())
+
+    elif query.data == "back_to_menu":
+        text, keyboard = main_menu()
+        await show_photo_screen(query, "main", text, reply_markup=keyboard)
+
+    elif query.data == "my_subscription":
+        vpn_name = get_vpn_client_name(query.from_user.id)
+
+        expired_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Купить подписку", callback_data="buy_subscription")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
+        ])
+
+        if not vpn_name:
+            await show_photo_screen(
+                query, "subscription",
+                "❌ Срок подписки истёк.\n\nОформите новую, чтобы снова получить доступ к VPN.",
+                reply_markup=expired_keyboard,
+            )
+            return
+
+        try:
+            client = await h1cloud_get_client_info(vpn_name)
+        except Exception:
+            await show_photo_screen(
+                query, "subscription",
+                "Не получилось получить данные о подписке. Попробуйте ещё раз чуть позже.",
+                reply_markup=back_only_keyboard(),
+            )
+            return
+
+        left_days = client.get("left_days", 0)
+
+        if left_days <= 0 or client.get("status") != "active":
+            await show_photo_screen(
+                query, "subscription",
+                "❌ Срок подписки истёк.\n\nОформите новую, чтобы снова получить доступ к VPN.",
+                reply_markup=expired_keyboard,
+            )
+            return
+
+        used_gb = client.get("traffic_used_gb", 0.0)
+        limit_gb = client.get("traffic_limit_gb", 0.0)
+        limit_text = f"{limit_gb:.1f} ГБ" if limit_gb else "безлимит"
+
+        text = (
+            "📊 *Моя подписка*\n\n"
+            f"Осталось дней: {left_days}\n"
+            f"Трафик использован: {used_gb:.2f} ГБ из {limit_text}\n\n"
+            "Ссылка-подписка:\n"
+            f"{client['sub_url']}"
+        )
+        await show_photo_screen(query, "subscription", text, reply_markup=back_only_keyboard())
+
+    elif query.data == "balance":
+        total = get_balance(query.from_user.id)
+        text, keyboard = balance_menu(total)
+        await show_photo_screen(query, "balance", text, reply_markup=keyboard)
+
+    elif query.data == "topup":
+        context.user_data["awaiting_topup"] = True
+        await show_photo_screen(
+            query, "balance",
+            "Напишите любую сумму, которую хотите пополнить (например: 100)",
+            reply_markup=back_only_keyboard(),
+        )
+
+    elif query.data == "promo":
+        context.user_data["awaiting_promo"] = True
+        await show_photo_screen(query, "promo", "Введите промокод:", reply_markup=back_only_keyboard())
+
+    elif query.data == "invite":
+        bot_username = context.bot.username
+        link = f"https://t.me/{bot_username}?start=ref_{query.from_user.id}"
+        count = count_referrals(query.from_user.id)
+        await show_photo_screen(
+            query, "invite",
+            f"👥 Ваша реферальная ссылка:\n{link}\n\n"
+            f"Приглашено друзей: {count}",
+            reply_markup=back_only_keyboard(),
+        )
+
+    elif query.data == "docs":
+        text, keyboard = docs_menu()
+        await show_photo_screen(query, "docs", text, reply_markup=keyboard)
+
+    elif query.data == "bot_policy":
+        await show_photo_screen(query, "docs", BOT_POLICY_TEXT, reply_markup=docs_back_keyboard())
+
+
+init_db()
+
+app = ApplicationBuilder().token(Token).build()
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("admin", admin_command))
+app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+app.run_polling()
